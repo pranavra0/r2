@@ -303,6 +303,29 @@ impl Term {
     pub fn lambda(parameters: u16, body: Term) -> Self {
         Self::Lambda(Lambda::new(parameters, body))
     }
+
+    pub fn is_closed(&self) -> bool {
+        self.is_closed_at(0)
+    }
+
+    fn is_closed_at(&self, depth: u32) -> bool {
+        match self {
+            Self::Var(index) => index.get() < depth,
+            Self::Value(_) => true,
+            Self::Lambda(lambda) => lambda
+                .body
+                .is_closed_at(depth.saturating_add(u32::from(lambda.parameters))),
+            Self::Apply { callee, args } => {
+                callee.is_closed_at(depth) && args.iter().all(|arg| arg.is_closed_at(depth))
+            }
+            Self::Perform { op: _, args } => args.iter().all(|arg| arg.is_closed_at(depth)),
+            Self::Handle { body, handlers } => {
+                body.is_closed_at(depth)
+                    && handlers.values().all(|handler| handler.is_closed_at(depth))
+            }
+            Self::Ref(_) => true,
+        }
+    }
 }
 
 impl Canonical for Term {
@@ -471,5 +494,29 @@ mod tests {
         let parsed = Digest::from_str(&rendered).expect("digest should parse");
 
         assert_eq!(parsed, digest);
+    }
+
+    #[test]
+    fn closedness_tracks_bound_variables() {
+        let open = Term::lambda(
+            1,
+            Term::Apply {
+                callee: Box::new(Term::var(1)),
+                args: vec![Term::var(0)],
+            },
+        );
+        let closed = Term::lambda(
+            1,
+            Term::lambda(
+                1,
+                Term::Apply {
+                    callee: Box::new(Term::var(1)),
+                    args: vec![Term::var(0)],
+                },
+            ),
+        );
+
+        assert!(!open.is_closed());
+        assert!(closed.is_closed());
     }
 }

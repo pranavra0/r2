@@ -22,6 +22,15 @@ impl RuntimeValue {
             _ => None,
         }
     }
+
+    pub fn reify(&self) -> Option<Reified> {
+        match self {
+            Self::Data(value) => Some(Reified::Value(value.clone())),
+            Self::Closure(closure) => Some(Reified::Lambda(closure.reify()?)),
+            Self::Continuation(_) => None,
+            Self::Ref(reference) => Some(Reified::Ref(reference.clone())),
+        }
+    }
 }
 
 impl fmt::Debug for RuntimeValue {
@@ -44,6 +53,21 @@ pub struct Closure {
 impl Closure {
     fn new(lambda: Lambda, env: Env) -> Self {
         Self { lambda, env }
+    }
+
+    fn reify(&self) -> Option<Lambda> {
+        let captured = self
+            .env
+            .iter()
+            .rev()
+            .map(|value| value.reify_term())
+            .collect::<Option<Vec<_>>>()?;
+        let body = close_term(
+            &self.lambda.body,
+            u32::from(self.lambda.parameters),
+            &captured,
+        )?;
+        Some(Lambda::new(self.lambda.parameters, body))
     }
 }
 
@@ -155,6 +179,31 @@ enum Control {
 pub enum EvalResult {
     Done(RuntimeValue),
     Yielded(Yielded),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Reified {
+    Value(Value),
+    Lambda(Lambda),
+    Ref(Ref),
+}
+
+impl Reified {
+    pub fn into_runtime(self) -> RuntimeValue {
+        match self {
+            Self::Value(value) => RuntimeValue::Data(value),
+            Self::Lambda(lambda) => RuntimeValue::Closure(Closure::new(lambda, Vec::new())),
+            Self::Ref(reference) => RuntimeValue::Ref(reference),
+        }
+    }
+
+    pub fn into_term(self) -> Term {
+        match self {
+            Self::Value(value) => Term::Value(value),
+            Self::Lambda(lambda) => Term::Lambda(lambda),
+            Self::Ref(reference) => Term::Ref(reference),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -496,6 +545,57 @@ fn lookup_var(env: &Env, index: VarIndex) -> Result<RuntimeValue, EvalError> {
     Ok(env[env_index].clone())
 }
 
+fn close_term(term: &Term, depth: u32, captured: &[Term]) -> Option<Term> {
+    match term {
+        Term::Var(index) => {
+            if index.get() < depth {
+                Some(Term::Var(*index))
+            } else {
+                let capture_index = usize::try_from(index.get() - depth)
+                    .expect("u32 always fits into usize on supported targets");
+                captured.get(capture_index).cloned()
+            }
+        }
+        Term::Value(value) => Some(Term::Value(value.clone())),
+        Term::Lambda(lambda) => Some(Term::Lambda(Lambda::new(
+            lambda.parameters,
+            close_term(
+                &lambda.body,
+                depth.saturating_add(u32::from(lambda.parameters)),
+                captured,
+            )?,
+        ))),
+        Term::Apply { callee, args } => Some(Term::Apply {
+            callee: Box::new(close_term(callee, depth, captured)?),
+            args: args
+                .iter()
+                .map(|arg| close_term(arg, depth, captured))
+                .collect::<Option<Vec<_>>>()?,
+        }),
+        Term::Perform { op, args } => Some(Term::Perform {
+            op: op.clone(),
+            args: args
+                .iter()
+                .map(|arg| close_term(arg, depth, captured))
+                .collect::<Option<Vec<_>>>()?,
+        }),
+        Term::Handle { body, handlers } => Some(Term::Handle {
+            body: Box::new(close_term(body, depth, captured)?),
+            handlers: handlers
+                .iter()
+                .map(|(op, handler)| Some((op.clone(), close_term(handler, depth, captured)?)))
+                .collect::<Option<BTreeMap<_, _>>>()?,
+        }),
+        Term::Ref(reference) => Some(Term::Ref(reference.clone())),
+    }
+}
+
+impl RuntimeValue {
+    fn reify_term(&self) -> Option<Term> {
+        Some(self.reify()?.into_term())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -665,5 +765,25 @@ mod tests {
 
         let second = yielded.continuation.resume(data(2));
         assert!(matches!(second, Err(EvalError::ContinuationAlreadyResumed)));
+    }
+
+    #[test]
+    fn reifies_closed_closures() {
+        let result = eval(Term::Apply {
+            callee: Box::new(Term::lambda(1, Term::lambda(1, Term::var(1)))),
+            args: vec![Term::Value(Value::Integer(11))],
+        })
+        .expect("evaluation should succeed");
+
+        let value = match result {
+            EvalResult::Done(value) => value,
+            other => panic!("expected final value, got {other:?}"),
+        };
+
+        let reified = value.reify().expect("closure should be reifiable");
+        assert_eq!(
+            reified,
+            Reified::Lambda(Lambda::new(1, Term::Value(Value::Integer(11))))
+        );
     }
 }
