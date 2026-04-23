@@ -132,7 +132,7 @@ fn path_from_bytes(bytes: Vec<u8>) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
@@ -175,14 +175,14 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn path_to_bytes(path: &PathBuf) -> Vec<u8> {
+    fn path_to_bytes(path: &Path) -> Vec<u8> {
         use std::os::unix::ffi::OsStrExt;
 
         path.as_os_str().as_bytes().to_vec()
     }
 
     #[cfg(not(unix))]
-    fn path_to_bytes(path: &PathBuf) -> Vec<u8> {
+    fn path_to_bytes(path: &Path) -> Vec<u8> {
         path.to_string_lossy().into_owned().into_bytes()
     }
 }

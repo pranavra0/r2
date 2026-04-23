@@ -122,10 +122,10 @@ impl<S: ObjectStore> Runtime<S> {
 
         let result = eval(term.clone())?;
 
-        if let (Some(digest), EvalResult::Done(value)) = (&digest, &result) {
-            if let Some(reified) = value.reify() {
-                self.memo.insert(*digest, reified);
-            }
+        if let (Some(digest), EvalResult::Done(value)) = (&digest, &result)
+            && let Some(reified) = value.reify()
+        {
+            self.memo.insert(*digest, reified);
         }
 
         Ok(result)
