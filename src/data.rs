@@ -212,6 +212,7 @@ pub enum Value {
     Integer(i64),
     Symbol(Symbol),
     Bytes(Vec<u8>),
+    List(Vec<Value>),
     Record(BTreeMap<Symbol, Value>),
     Tagged { tag: Symbol, fields: Vec<Value> },
 }
@@ -231,8 +232,15 @@ impl Canonical for Value {
                 out.push(0x03);
                 write_bytes(out, bytes);
             }
-            Self::Record(entries) => {
+            Self::List(items) => {
                 out.push(0x04);
+                write_len(out, items.len());
+                for item in items {
+                    item.write_canonical(out);
+                }
+            }
+            Self::Record(entries) => {
+                out.push(0x05);
                 write_len(out, entries.len());
                 for (key, value) in entries {
                     key.write_canonical(out);
@@ -240,7 +248,7 @@ impl Canonical for Value {
                 }
             }
             Self::Tagged { tag, fields } => {
-                out.push(0x05);
+                out.push(0x06);
                 tag.write_canonical(out);
                 write_len(out, fields.len());
                 for field in fields {

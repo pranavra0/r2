@@ -37,6 +37,10 @@ impl Host {
     pub fn install_fs_read(&mut self) {
         self.register("fs.read", fs_read_handler);
     }
+
+    pub fn install_fs_write(&mut self) {
+        self.register("fs.write", fs_write_handler);
+    }
 }
 
 impl Default for Host {
@@ -110,6 +114,29 @@ fn fs_read_handler(
     continuation.resume(value).map_err(Into::into)
 }
 
+fn fs_write_handler(
+    args: Vec<RuntimeValue>,
+    continuation: Continuation,
+) -> Result<EvalResult, HostError> {
+    let value = match args.as_slice() {
+        [
+            RuntimeValue::Data(Value::Bytes(path)),
+            RuntimeValue::Data(Value::Bytes(bytes)),
+        ] => {
+            let path = path_from_bytes(path.clone());
+            match std::fs::write(path, bytes) {
+                Ok(()) => RuntimeValue::Data(Value::Integer(
+                    i64::try_from(bytes.len()).expect("byte length should fit into i64"),
+                )),
+                Err(error) => error_value(error.to_string()),
+            }
+        }
+        _ => error_value("fs.write expected a bytes path and bytes contents"),
+    };
+
+    continuation.resume(value).map_err(Into::into)
+}
+
 fn error_value(message: impl Into<String>) -> RuntimeValue {
     RuntimeValue::Data(Value::Tagged {
         tag: Symbol::from("error"),
@@ -160,6 +187,36 @@ mod tests {
             RuntimeValue::Data(Value::Bytes(bytes)) => assert_eq!(bytes, expected),
             other => panic!("unexpected result: {other:?}"),
         }
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn fs_write_runs_end_to_end() {
+        let path = unique_temp_path("r2-fs-write");
+        let expected = b"hello from write".to_vec();
+
+        let mut runtime = Runtime::new();
+        let mut host = Host::new();
+        host.install_fs_write();
+
+        let program = Term::Perform {
+            op: Symbol::from("fs.write"),
+            args: vec![
+                Term::Value(Value::Bytes(path_to_bytes(&path))),
+                Term::Value(Value::Bytes(expected.clone())),
+            ],
+        };
+
+        let result = runtime.run(program, &mut host).expect("program should run");
+
+        match result {
+            RuntimeValue::Data(Value::Integer(written)) => {
+                assert_eq!(written, i64::try_from(expected.len()).unwrap())
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), expected);
 
         let _ = std::fs::remove_file(path);
     }
