@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::rc::Rc;
 
-use crate::data::{Lambda, Ref, Symbol, Term, Value, VarIndex};
+use crate::{Lambda, Ref, Symbol, Term, Value, VarIndex};
 
 type Env = Vec<RuntimeValue>;
 
@@ -599,7 +599,7 @@ impl RuntimeValue {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::Symbol;
+    use crate::Symbol;
 
     fn data(value: i64) -> RuntimeValue {
         RuntimeValue::Data(Value::Integer(value))

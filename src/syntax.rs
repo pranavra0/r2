@@ -1,8 +1,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use crate::data::{Symbol, Term, Value};
-use crate::thunk;
+use crate::{Symbol, Term, Value, thunk};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SyntaxError {
@@ -936,7 +935,7 @@ fn line_and_column(source: &str, offset: usize) -> (usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::eval::{EvalResult, RuntimeValue, eval};
+    use crate::{EvalResult, RuntimeValue, eval};
 
     #[test]
     fn parses_and_runs_let_lambda_calls() {

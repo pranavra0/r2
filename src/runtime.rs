@@ -4,7 +4,9 @@ use std::fmt;
 use crate::Canonical;
 use crate::data::{Digest, Ref, Symbol, Term, Value};
 use crate::eval::{EvalError, EvalResult, Reified, RuntimeValue, Yielded, eval};
-use crate::host::{HostError, HostHandler};
+use crate::host::{
+    HostEffectCaching, HostEffectPolicy, HostEffectProvenance, HostError, HostHandler,
+};
 use crate::store::{MemoryStore, ObjectStore, StoreError, Stored};
 use crate::thunk::{self, ThunkError};
 
@@ -55,6 +57,279 @@ impl From<ThunkError> for RuntimeError {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuntimeStoredKind {
+    Term,
+    Value,
+}
+
+impl fmt::Display for RuntimeStoredKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Term => f.write_str("term"),
+            Self::Value => f.write_str("value"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuntimeValueKind {
+    Data,
+    Closure,
+    Continuation,
+    Ref,
+}
+
+impl RuntimeValueKind {
+    fn of(value: &RuntimeValue) -> Self {
+        match value {
+            RuntimeValue::Data(_) => Self::Data,
+            RuntimeValue::Closure(_) => Self::Closure,
+            RuntimeValue::Continuation(_) => Self::Continuation,
+            RuntimeValue::Ref(_) => Self::Ref,
+        }
+    }
+}
+
+impl fmt::Display for RuntimeValueKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Data => f.write_str("data"),
+            Self::Closure => f.write_str("closure"),
+            Self::Continuation => f.write_str("continuation"),
+            Self::Ref => f.write_str("ref"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RuntimeTraceEvent {
+    EvalStart {
+        closed: bool,
+        digest: Option<Digest>,
+    },
+    MemoHit {
+        digest: Digest,
+    },
+    MemoStore {
+        digest: Digest,
+    },
+    RefLoad {
+        hash: Digest,
+        kind: RuntimeStoredKind,
+    },
+    Yield {
+        op: Symbol,
+    },
+    BuiltinHandle {
+        op: Symbol,
+    },
+    HostHandle {
+        op: Symbol,
+        policy: HostEffectPolicy,
+    },
+    UnhandledEffect {
+        op: Symbol,
+    },
+    ThunkForce {
+        key: Digest,
+    },
+    ThunkCacheHit {
+        key: Digest,
+    },
+    ThunkCacheStore {
+        key: Digest,
+    },
+    ThunkCacheBypass {
+        key: Digest,
+        op: Option<Symbol>,
+        policy: Option<HostEffectPolicy>,
+    },
+    Persisted {
+        hash: Digest,
+        kind: RuntimeStoredKind,
+    },
+    RunComplete {
+        kind: RuntimeValueKind,
+    },
+}
+
+impl fmt::Display for RuntimeTraceEvent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EvalStart {
+                closed: true,
+                digest: Some(digest),
+            } => write!(f, "eval start: closed {digest}"),
+            Self::EvalStart {
+                closed: true,
+                digest: None,
+            } => f.write_str("eval start: closed"),
+            Self::EvalStart { closed: false, .. } => f.write_str("eval start: open"),
+            Self::MemoHit { digest } => write!(f, "memo hit: {digest}"),
+            Self::MemoStore { digest } => write!(f, "memo store: {digest}"),
+            Self::RefLoad { hash, kind } => write!(f, "load {kind}: {hash}"),
+            Self::Yield { op } => write!(f, "yield: {op}"),
+            Self::BuiltinHandle { op } => write!(f, "builtin handle: {op}"),
+            Self::HostHandle { op, policy } => write!(f, "host handle: {op} [{policy}]"),
+            Self::UnhandledEffect { op } => write!(f, "unhandled effect: {op}"),
+            Self::ThunkForce { key } => write!(f, "thunk force: {key}"),
+            Self::ThunkCacheHit { key } => write!(f, "thunk cache hit: {key}"),
+            Self::ThunkCacheStore { key } => write!(f, "thunk cache store: {key}"),
+            Self::ThunkCacheBypass {
+                key,
+                op: Some(op),
+                policy: Some(policy),
+            } => {
+                write!(f, "thunk cache bypass: {key} due to {policy} effect {op}")
+            }
+            Self::ThunkCacheBypass { key, op: None, .. } => {
+                write!(f, "thunk cache bypass: {key}")
+            }
+            Self::ThunkCacheBypass {
+                key,
+                op: Some(op),
+                policy: None,
+            } => write!(f, "thunk cache bypass: {key} due to effect {op}"),
+            Self::Persisted { hash, kind } => write!(f, "persist {kind}: {hash}"),
+            Self::RunComplete { kind } => write!(f, "run complete: {kind}"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RuntimeTrace {
+    events: Vec<RuntimeTraceEvent>,
+}
+
+impl RuntimeTrace {
+    pub fn events(&self) -> &[RuntimeTraceEvent] {
+        &self.events
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.events.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.events.len()
+    }
+
+    pub fn step_count(&self) -> usize {
+        self.events.len()
+    }
+
+    pub fn summary(&self) -> RuntimeTraceSummary {
+        let mut summary = RuntimeTraceSummary {
+            total_events: self.events.len(),
+            ..RuntimeTraceSummary::default()
+        };
+
+        for event in &self.events {
+            match event {
+                RuntimeTraceEvent::EvalStart { .. } => summary.eval_starts += 1,
+                RuntimeTraceEvent::MemoHit { .. } => summary.memo_hits += 1,
+                RuntimeTraceEvent::MemoStore { .. } => summary.memo_stores += 1,
+                RuntimeTraceEvent::RefLoad { .. } => summary.ref_loads += 1,
+                RuntimeTraceEvent::Yield { .. } => summary.yields += 1,
+                RuntimeTraceEvent::BuiltinHandle { .. } => summary.builtin_handles += 1,
+                RuntimeTraceEvent::HostHandle { policy, .. } => {
+                    summary.host_handles += 1;
+                    match (policy.caching(), policy.provenance()) {
+                        (HostEffectCaching::Deny, HostEffectProvenance::Ambient) => {
+                            summary.volatile_host_handles += 1;
+                        }
+                        (HostEffectCaching::Allow, HostEffectProvenance::Ambient) => {
+                            summary.stable_host_handles += 1;
+                        }
+                        (HostEffectCaching::Deny, HostEffectProvenance::Declared) => {
+                            summary.declared_host_handles += 1;
+                        }
+                        (HostEffectCaching::Allow, HostEffectProvenance::Declared) => {
+                            summary.hermetic_host_handles += 1;
+                        }
+                    }
+                }
+                RuntimeTraceEvent::UnhandledEffect { .. } => summary.unhandled_effects += 1,
+                RuntimeTraceEvent::ThunkForce { .. } => summary.thunk_forces += 1,
+                RuntimeTraceEvent::ThunkCacheHit { .. } => summary.thunk_cache_hits += 1,
+                RuntimeTraceEvent::ThunkCacheStore { .. } => summary.thunk_cache_stores += 1,
+                RuntimeTraceEvent::ThunkCacheBypass { .. } => summary.thunk_cache_bypasses += 1,
+                RuntimeTraceEvent::Persisted { kind, .. } => {
+                    summary.persisted += 1;
+                    match kind {
+                        RuntimeStoredKind::Term => summary.persisted_terms += 1,
+                        RuntimeStoredKind::Value => summary.persisted_values += 1,
+                    }
+                }
+                RuntimeTraceEvent::RunComplete { .. } => summary.run_completions += 1,
+            }
+        }
+
+        summary
+    }
+
+    fn push(&mut self, event: RuntimeTraceEvent) {
+        self.events.push(event);
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RuntimeTraceSummary {
+    pub total_events: usize,
+    pub eval_starts: usize,
+    pub memo_hits: usize,
+    pub memo_stores: usize,
+    pub ref_loads: usize,
+    pub yields: usize,
+    pub builtin_handles: usize,
+    pub host_handles: usize,
+    pub stable_host_handles: usize,
+    pub volatile_host_handles: usize,
+    pub declared_host_handles: usize,
+    pub hermetic_host_handles: usize,
+    pub unhandled_effects: usize,
+    pub thunk_forces: usize,
+    pub thunk_cache_hits: usize,
+    pub thunk_cache_stores: usize,
+    pub thunk_cache_bypasses: usize,
+    pub persisted: usize,
+    pub persisted_terms: usize,
+    pub persisted_values: usize,
+    pub run_completions: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct TracedRun {
+    pub value: RuntimeValue,
+    pub trace: RuntimeTrace,
+}
+
+trait TraceSink {
+    fn record(&mut self, event: RuntimeTraceEvent);
+}
+
+#[derive(Default)]
+struct NullTrace;
+
+impl TraceSink for NullTrace {
+    fn record(&mut self, _event: RuntimeTraceEvent) {}
+}
+
+impl TraceSink for RuntimeTrace {
+    fn record(&mut self, event: RuntimeTraceEvent) {
+        self.push(event);
+    }
+}
+
+#[derive(Clone, Debug)]
+struct RunOutcome {
+    value: RuntimeValue,
+    cacheable: bool,
+    uncacheable_effect: Option<Symbol>,
+    uncacheable_policy: Option<HostEffectPolicy>,
+}
+
 #[derive(Clone, Debug)]
 pub struct Runtime<S = MemoryStore> {
     store: S,
@@ -102,21 +377,40 @@ impl<S> Runtime<S> {
 
 impl<S: ObjectStore> Runtime<S> {
     pub fn intern_term(&mut self, term: Term) -> Result<Ref, RuntimeError> {
-        self.store.put(Stored::term(term)).map_err(Into::into)
+        let mut trace = NullTrace;
+        self.intern_term_with_trace(term, &mut trace)
     }
 
     pub fn intern_value(&mut self, value: Value) -> Result<Ref, RuntimeError> {
-        self.store.put(Stored::value(value)).map_err(Into::into)
+        let mut trace = NullTrace;
+        self.intern_value_with_trace(value, &mut trace)
     }
 
     pub fn load(&self, reference: &Ref) -> Result<Stored, RuntimeError> {
-        self.store.load(reference).map_err(Into::into)
+        let mut trace = NullTrace;
+        self.load_with_trace(reference, &mut trace)
     }
 
     pub fn eval(&mut self, term: Term) -> Result<EvalResult, RuntimeError> {
+        let mut trace = NullTrace;
+        self.eval_with_trace_sink(term, &mut trace)
+    }
+
+    fn eval_with_trace_sink<T: TraceSink>(
+        &mut self,
+        term: Term,
+        trace: &mut T,
+    ) -> Result<EvalResult, RuntimeError> {
         let digest = term.is_closed().then(|| term.digest());
+        trace.record(RuntimeTraceEvent::EvalStart {
+            closed: digest.is_some(),
+            digest,
+        });
 
         if let Some(reified) = digest.and_then(|digest| self.memo.get(&digest).cloned()) {
+            trace.record(RuntimeTraceEvent::MemoHit {
+                digest: digest.unwrap(),
+            });
             return Ok(EvalResult::Done(reified.into_runtime()));
         }
 
@@ -126,14 +420,24 @@ impl<S: ObjectStore> Runtime<S> {
             && let Some(reified) = value.reify()
         {
             self.memo.insert(*digest, reified);
+            trace.record(RuntimeTraceEvent::MemoStore { digest: *digest });
         }
 
         Ok(result)
     }
 
     pub fn eval_ref(&mut self, reference: &Ref) -> Result<EvalResult, RuntimeError> {
-        match self.load(reference)? {
-            Stored::Term(term) => self.eval(term),
+        let mut trace = NullTrace;
+        self.eval_ref_with_trace_sink(reference, &mut trace)
+    }
+
+    fn eval_ref_with_trace_sink<T: TraceSink>(
+        &mut self,
+        reference: &Ref,
+        trace: &mut T,
+    ) -> Result<EvalResult, RuntimeError> {
+        match self.load_with_trace(reference, trace)? {
+            Stored::Term(term) => self.eval_with_trace_sink(term, trace),
             Stored::Value(value) => Ok(EvalResult::Done(RuntimeValue::Data(value))),
         }
     }
@@ -143,8 +447,18 @@ impl<S: ObjectStore> Runtime<S> {
         term: Term,
         host: &mut H,
     ) -> Result<RuntimeValue, RuntimeError> {
-        let result = self.eval(term)?;
-        self.drive(result, host)
+        let mut trace = NullTrace;
+        Ok(self.run_with_trace_sink(term, host, &mut trace)?.value)
+    }
+
+    pub fn run_with_trace<H: HostHandler>(
+        &mut self,
+        term: Term,
+        host: &mut H,
+    ) -> Result<TracedRun, RuntimeError> {
+        let mut trace = RuntimeTrace::default();
+        let value = self.run_with_trace_sink(term, host, &mut trace)?.value;
+        Ok(TracedRun { value, trace })
     }
 
     pub fn run_ref<H: HostHandler>(
@@ -152,26 +466,141 @@ impl<S: ObjectStore> Runtime<S> {
         reference: &Ref,
         host: &mut H,
     ) -> Result<RuntimeValue, RuntimeError> {
-        let result = self.eval_ref(reference)?;
-        self.drive(result, host)
+        let mut trace = NullTrace;
+        Ok(self
+            .run_ref_with_trace_sink(reference, host, &mut trace)?
+            .value)
     }
 
-    fn drive<H: HostHandler>(
+    pub fn run_ref_with_trace<H: HostHandler>(
+        &mut self,
+        reference: &Ref,
+        host: &mut H,
+    ) -> Result<TracedRun, RuntimeError> {
+        let mut trace = RuntimeTrace::default();
+        let value = self
+            .run_ref_with_trace_sink(reference, host, &mut trace)?
+            .value;
+        Ok(TracedRun { value, trace })
+    }
+
+    fn intern_term_with_trace<T: TraceSink>(
+        &mut self,
+        term: Term,
+        trace: &mut T,
+    ) -> Result<Ref, RuntimeError> {
+        let reference = self
+            .store
+            .put(Stored::term(term))
+            .map_err(RuntimeError::from)?;
+        trace.record(RuntimeTraceEvent::Persisted {
+            hash: reference.hash,
+            kind: RuntimeStoredKind::Term,
+        });
+        Ok(reference)
+    }
+
+    fn intern_value_with_trace<T: TraceSink>(
+        &mut self,
+        value: Value,
+        trace: &mut T,
+    ) -> Result<Ref, RuntimeError> {
+        let reference = self
+            .store
+            .put(Stored::value(value))
+            .map_err(RuntimeError::from)?;
+        trace.record(RuntimeTraceEvent::Persisted {
+            hash: reference.hash,
+            kind: RuntimeStoredKind::Value,
+        });
+        Ok(reference)
+    }
+
+    fn load_with_trace<T: TraceSink>(
+        &self,
+        reference: &Ref,
+        trace: &mut T,
+    ) -> Result<Stored, RuntimeError> {
+        let stored = self.store.load(reference).map_err(RuntimeError::from)?;
+        trace.record(RuntimeTraceEvent::RefLoad {
+            hash: reference.hash,
+            kind: stored.kind(),
+        });
+        Ok(stored)
+    }
+
+    fn run_with_trace_sink<H: HostHandler, T: TraceSink>(
+        &mut self,
+        term: Term,
+        host: &mut H,
+        trace: &mut T,
+    ) -> Result<RunOutcome, RuntimeError> {
+        let result = self.eval_with_trace_sink(term, trace)?;
+        self.drive_with_trace(result, host, trace)
+    }
+
+    fn run_ref_with_trace_sink<H: HostHandler, T: TraceSink>(
+        &mut self,
+        reference: &Ref,
+        host: &mut H,
+        trace: &mut T,
+    ) -> Result<RunOutcome, RuntimeError> {
+        let result = self.eval_ref_with_trace_sink(reference, trace)?;
+        self.drive_with_trace(result, host, trace)
+    }
+
+    fn drive_with_trace<H: HostHandler, T: TraceSink>(
         &mut self,
         mut result: EvalResult,
         host: &mut H,
-    ) -> Result<RuntimeValue, RuntimeError> {
+        trace: &mut T,
+    ) -> Result<RunOutcome, RuntimeError> {
+        let mut cacheable = true;
+        let mut uncacheable_effect = None;
+        let mut uncacheable_policy = None;
+
         loop {
             match result {
-                EvalResult::Done(value) => return Ok(value),
+                EvalResult::Done(value) => {
+                    trace.record(RuntimeTraceEvent::RunComplete {
+                        kind: RuntimeValueKind::of(&value),
+                    });
+                    return Ok(RunOutcome {
+                        value,
+                        cacheable,
+                        uncacheable_effect,
+                        uncacheable_policy,
+                    });
+                }
                 EvalResult::Yielded(yielded) => {
-                    if let Some(next) = self.handle_builtin(yielded.clone(), host)? {
+                    trace.record(RuntimeTraceEvent::Yield {
+                        op: yielded.op.clone(),
+                    });
+                    if let Some(next) =
+                        self.handle_builtin_with_trace(yielded.clone(), host, trace)?
+                    {
+                        trace.record(RuntimeTraceEvent::BuiltinHandle { op: yielded.op });
                         result = next;
                     } else if let Some(next) =
                         host.handle(&yielded.op, yielded.args, yielded.continuation)?
                     {
+                        let policy = host.effect_policy(&yielded.op);
+                        if !policy.allows_thunk_cache() {
+                            cacheable = false;
+                            if uncacheable_effect.is_none() {
+                                uncacheable_effect = Some(yielded.op.clone());
+                                uncacheable_policy = Some(policy);
+                            }
+                        }
+                        trace.record(RuntimeTraceEvent::HostHandle {
+                            op: yielded.op,
+                            policy,
+                        });
                         result = next;
                     } else {
+                        trace.record(RuntimeTraceEvent::UnhandledEffect {
+                            op: yielded.op.clone(),
+                        });
                         return Err(RuntimeError::UnhandledEffect { op: yielded.op });
                     }
                 }
@@ -179,31 +608,36 @@ impl<S: ObjectStore> Runtime<S> {
         }
     }
 
-    fn handle_builtin<H: HostHandler>(
+    fn handle_builtin_with_trace<H: HostHandler, T: TraceSink>(
         &mut self,
         yielded: Yielded,
         host: &mut H,
+        trace: &mut T,
     ) -> Result<Option<EvalResult>, RuntimeError> {
         if yielded.op.as_str() == thunk::FORCE_OP {
-            return Ok(Some(self.handle_thunk_force(yielded, host)?));
+            return Ok(Some(
+                self.handle_thunk_force_with_trace(yielded, host, trace)?,
+            ));
         }
 
         Ok(None)
     }
 
-    fn handle_thunk_force<H: HostHandler>(
+    fn handle_thunk_force_with_trace<H: HostHandler, T: TraceSink>(
         &mut self,
         yielded: Yielded,
         host: &mut H,
+        trace: &mut T,
     ) -> Result<EvalResult, RuntimeError> {
-        let value = self.force_thunk_args(yielded.args, host)?;
+        let value = self.force_thunk_args_with_trace(yielded.args, host, trace)?;
         yielded.continuation.resume(value).map_err(Into::into)
     }
 
-    fn force_thunk_args<H: HostHandler>(
+    fn force_thunk_args_with_trace<H: HostHandler, T: TraceSink>(
         &mut self,
         args: Vec<RuntimeValue>,
         host: &mut H,
+        trace: &mut T,
     ) -> Result<RuntimeValue, RuntimeError> {
         let mut args = args.into_iter();
         let thunk = args.next().ok_or(ThunkError::WrongArgumentCount {
@@ -219,35 +653,57 @@ impl<S: ObjectStore> Runtime<S> {
             .into());
         }
 
-        self.force_thunk(thunk, host)
+        self.force_thunk_with_trace(thunk, host, trace)
     }
 
-    fn force_thunk<H: HostHandler>(
+    fn force_thunk_with_trace<H: HostHandler, T: TraceSink>(
         &mut self,
         thunk_value: RuntimeValue,
         host: &mut H,
+        trace: &mut T,
     ) -> Result<RuntimeValue, RuntimeError> {
         let (key, term) = reified_thunk_term(&thunk_value)?;
+        trace.record(RuntimeTraceEvent::ThunkForce { key });
 
         if let Some(reified) = self.thunk_cache.get(&key).cloned() {
+            trace.record(RuntimeTraceEvent::ThunkCacheHit { key });
             return Ok(reified.into_runtime());
         }
 
-        let value = self.run(term, host)?;
-        let reified = value.reify().ok_or(ThunkError::UncacheableResult)?.clone();
+        let outcome = self.run_with_trace_sink(term, host, trace)?;
 
-        self.persist_reified(&reified)?;
+        if !outcome.cacheable {
+            trace.record(RuntimeTraceEvent::ThunkCacheBypass {
+                key,
+                op: outcome.uncacheable_effect,
+                policy: outcome.uncacheable_policy,
+            });
+            return Ok(outcome.value);
+        }
+
+        let reified = outcome
+            .value
+            .reify()
+            .ok_or(ThunkError::UncacheableResult)?
+            .clone();
+
+        self.persist_reified_with_trace(&reified, trace)?;
         self.thunk_cache.insert(key, reified.clone());
+        trace.record(RuntimeTraceEvent::ThunkCacheStore { key });
         Ok(reified.into_runtime())
     }
 
-    fn persist_reified(&mut self, reified: &Reified) -> Result<(), RuntimeError> {
+    fn persist_reified_with_trace<T: TraceSink>(
+        &mut self,
+        reified: &Reified,
+        trace: &mut T,
+    ) -> Result<(), RuntimeError> {
         match reified {
             Reified::Value(value) => {
-                self.intern_value(value.clone())?;
+                self.intern_value_with_trace(value.clone(), trace)?;
             }
             Reified::Lambda(lambda) => {
-                self.intern_term(Term::Lambda(lambda.clone()))?;
+                self.intern_term_with_trace(Term::Lambda(lambda.clone()), trace)?;
             }
             Reified::Ref(_) => {}
         }
@@ -277,22 +733,36 @@ fn reified_thunk_term(thunk_value: &RuntimeValue) -> Result<(Digest, Term), Thun
     }
 }
 
+impl Stored {
+    fn kind(&self) -> RuntimeStoredKind {
+        match self {
+            Self::Term(_) => RuntimeStoredKind::Term,
+            Self::Value(_) => RuntimeStoredKind::Value,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
 
     use super::*;
-    use crate::host::Host;
+    use crate::host::{Host, HostEffectPolicy};
 
     fn counting_host(counter: Rc<RefCell<usize>>) -> Host {
         let mut host = Host::new();
-        host.register("count.tick", move |_args, continuation| {
-            *counter.borrow_mut() += 1;
-            continuation
-                .resume(RuntimeValue::Data(Value::Integer(1)))
-                .map_err(Into::into)
-        });
+        host.register_with_policy(
+            "count.tick",
+            HostEffectPolicy::stable(),
+            move |_args, continuation| {
+                let mut value = counter.borrow_mut();
+                *value += 1;
+                continuation
+                    .resume(RuntimeValue::Data(Value::Integer(1)))
+                    .map_err(Into::into)
+            },
+        );
         host
     }
 
@@ -444,5 +914,189 @@ mod tests {
         }
         assert_eq!(*counter.borrow(), 1);
         assert_eq!(runtime.thunk_cache_len(), 2);
+    }
+
+    #[test]
+    fn volatile_host_effects_do_not_enter_thunk_cache() {
+        let counter = Rc::new(RefCell::new(0));
+        let mut host = Host::new();
+        host.register("count.tick", {
+            let counter = counter.clone();
+            move |_args, continuation| {
+                let mut value = counter.borrow_mut();
+                *value += 1;
+                continuation
+                    .resume(RuntimeValue::Data(Value::Integer(
+                        i64::try_from(*value).unwrap(),
+                    )))
+                    .map_err(Into::into)
+            }
+        });
+
+        let mut runtime = Runtime::new();
+        let thunk = thunk::delay(Term::Perform {
+            op: Symbol::from("count.tick"),
+            args: Vec::new(),
+        });
+        let program = Term::Apply {
+            callee: Box::new(Term::lambda(
+                1,
+                Term::Apply {
+                    callee: Box::new(Term::lambda(1, thunk::force(Term::var(1)))),
+                    args: vec![thunk::force(Term::var(0))],
+                },
+            )),
+            args: vec![thunk],
+        };
+
+        let result = runtime.run(program, &mut host).expect("program should run");
+
+        match result {
+            RuntimeValue::Data(Value::Integer(value)) => assert_eq!(value, 2),
+            other => panic!("unexpected result: {other:?}"),
+        }
+        assert_eq!(*counter.borrow(), 2);
+        assert_eq!(runtime.thunk_cache_len(), 0);
+    }
+
+    #[test]
+    fn traced_runs_record_thunk_and_host_activity() {
+        let counter = Rc::new(RefCell::new(0));
+        let mut host = counting_host(counter.clone());
+        let mut runtime = Runtime::new();
+        let thunk = thunk::delay(Term::Perform {
+            op: Symbol::from("count.tick"),
+            args: Vec::new(),
+        });
+        let program = Term::Apply {
+            callee: Box::new(Term::lambda(
+                1,
+                Term::Apply {
+                    callee: Box::new(Term::lambda(1, thunk::force(Term::var(1)))),
+                    args: vec![thunk::force(Term::var(0))],
+                },
+            )),
+            args: vec![thunk],
+        };
+
+        let traced = runtime
+            .run_with_trace(program, &mut host)
+            .expect("program should run");
+
+        match traced.value {
+            RuntimeValue::Data(Value::Integer(value)) => assert_eq!(value, 1),
+            other => panic!("unexpected result: {other:?}"),
+        }
+        assert_eq!(*counter.borrow(), 1);
+        assert!(
+            traced
+                .trace
+                .events()
+                .iter()
+                .any(|event| matches!(event, RuntimeTraceEvent::ThunkForce { .. }))
+        );
+        assert!(
+            traced
+                .trace
+                .events()
+                .iter()
+                .any(|event| matches!(event, RuntimeTraceEvent::ThunkCacheHit { .. }))
+        );
+        assert!(traced.trace.events().iter().any(|event| matches!(
+            event,
+            RuntimeTraceEvent::HostHandle { op, policy }
+                if op.as_str() == "count.tick" && *policy == HostEffectPolicy::stable()
+        )));
+    }
+
+    #[test]
+    fn traced_runs_record_volatile_thunk_cache_bypass() {
+        let counter = Rc::new(RefCell::new(0));
+        let mut host = Host::new();
+        host.register("count.tick", {
+            let counter = counter.clone();
+            move |_args, continuation| {
+                let mut value = counter.borrow_mut();
+                *value += 1;
+                continuation
+                    .resume(RuntimeValue::Data(Value::Integer(1)))
+                    .map_err(Into::into)
+            }
+        });
+        let mut runtime = Runtime::new();
+        let thunk = thunk::delay(Term::Perform {
+            op: Symbol::from("count.tick"),
+            args: Vec::new(),
+        });
+        let program = Term::Apply {
+            callee: Box::new(Term::lambda(
+                1,
+                Term::Apply {
+                    callee: Box::new(Term::lambda(1, thunk::force(Term::var(1)))),
+                    args: vec![thunk::force(Term::var(0))],
+                },
+            )),
+            args: vec![thunk],
+        };
+
+        let traced = runtime
+            .run_with_trace(program, &mut host)
+            .expect("program should run");
+
+        match traced.value {
+            RuntimeValue::Data(Value::Integer(value)) => assert_eq!(value, 1),
+            other => panic!("unexpected result: {other:?}"),
+        }
+        assert_eq!(*counter.borrow(), 2);
+        assert!(traced.trace.events().iter().any(|event| matches!(
+            event,
+            RuntimeTraceEvent::ThunkCacheBypass {
+                op: Some(op),
+                policy: Some(policy),
+                ..
+            } if op.as_str() == "count.tick" && *policy == HostEffectPolicy::volatile()
+        )));
+    }
+
+    #[test]
+    fn trace_summary_counts_boundary_activity() {
+        let counter = Rc::new(RefCell::new(0));
+        let mut host = counting_host(counter);
+        let mut runtime = Runtime::new();
+        let thunk = thunk::delay(Term::Perform {
+            op: Symbol::from("count.tick"),
+            args: Vec::new(),
+        });
+        let program = Term::Apply {
+            callee: Box::new(Term::lambda(
+                1,
+                Term::Apply {
+                    callee: Box::new(Term::lambda(1, thunk::force(Term::var(1)))),
+                    args: vec![thunk::force(Term::var(0))],
+                },
+            )),
+            args: vec![thunk],
+        };
+
+        let traced = runtime
+            .run_with_trace(program, &mut host)
+            .expect("program should run");
+        let summary = traced.trace.summary();
+
+        assert_eq!(summary.total_events, traced.trace.step_count());
+        assert_eq!(summary.yields, 3);
+        assert_eq!(summary.builtin_handles, 2);
+        assert_eq!(summary.host_handles, 1);
+        assert_eq!(summary.stable_host_handles, 1);
+        assert_eq!(summary.volatile_host_handles, 0);
+        assert_eq!(summary.declared_host_handles, 0);
+        assert_eq!(summary.hermetic_host_handles, 0);
+        assert_eq!(summary.thunk_forces, 2);
+        assert_eq!(summary.thunk_cache_hits, 1);
+        assert_eq!(summary.thunk_cache_stores, 1);
+        assert_eq!(summary.persisted, 1);
+        assert_eq!(summary.persisted_values, 1);
+        assert_eq!(summary.persisted_terms, 0);
+        assert_eq!(summary.run_completions, 2);
     }
 }

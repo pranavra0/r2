@@ -1,6 +1,6 @@
 use std::fmt;
 
-use crate::data::{Symbol, Term};
+use crate::{Symbol, Term};
 
 pub const FORCE_OP: &str = "thunk.force";
 

@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
-use crate::data::{Canonical, Digest, Ref, Term, Value};
+use crate::{Canonical, Digest, Ref, Term, Value};
 
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -282,7 +282,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
-    use crate::data::Symbol;
+    use crate::Symbol;
 
     #[test]
     fn rejects_open_terms() {
