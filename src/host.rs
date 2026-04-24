@@ -38,10 +38,7 @@ pub struct HostEffectPolicy {
 }
 
 impl HostEffectPolicy {
-    pub const fn new(
-        caching: HostEffectCaching,
-        provenance: HostEffectProvenance,
-    ) -> Self {
+    pub const fn new(caching: HostEffectCaching, provenance: HostEffectProvenance) -> Self {
         Self {
             caching,
             provenance,
@@ -86,18 +83,10 @@ impl Default for HostEffectPolicy {
 impl fmt::Display for HostEffectPolicy {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match (self.caching, self.provenance) {
-            (HostEffectCaching::Deny, HostEffectProvenance::Ambient) => {
-                f.write_str("volatile")
-            }
-            (HostEffectCaching::Allow, HostEffectProvenance::Ambient) => {
-                f.write_str("stable")
-            }
-            (HostEffectCaching::Deny, HostEffectProvenance::Declared) => {
-                f.write_str("declared")
-            }
-            (HostEffectCaching::Allow, HostEffectProvenance::Declared) => {
-                f.write_str("hermetic")
-            }
+            (HostEffectCaching::Deny, HostEffectProvenance::Ambient) => f.write_str("volatile"),
+            (HostEffectCaching::Allow, HostEffectProvenance::Ambient) => f.write_str("stable"),
+            (HostEffectCaching::Deny, HostEffectProvenance::Declared) => f.write_str("declared"),
+            (HostEffectCaching::Allow, HostEffectProvenance::Declared) => f.write_str("hermetic"),
         }
     }
 }
@@ -335,9 +324,7 @@ fn parse_fs_read_request(request: &BTreeMap<Symbol, Value>) -> Result<Vec<u8>, S
     )
 }
 
-fn parse_fs_write_request(
-    request: &BTreeMap<Symbol, Value>,
-) -> Result<(Vec<u8>, Vec<u8>), String> {
+fn parse_fs_write_request(request: &BTreeMap<Symbol, Value>) -> Result<(Vec<u8>, Vec<u8>), String> {
     Ok((
         parse_bytes(
             required_record_field(request, "path", FS_WRITE_OP)?,
@@ -801,12 +788,12 @@ mod tests {
 
     use super::*;
     use crate::data::Term;
-    use crate::effects::clock;
+    use crate::effects::{clock, fs};
     use crate::runtime::Runtime;
     use crate::thunk;
 
     #[test]
-    fn fs_read_runs_end_to_end() {
+    fn fs_read_runs_end_to_end_with_explicit_result_shape() {
         let path = unique_temp_path("r2-fs-read");
         let expected = b"hello from host".to_vec();
         std::fs::write(&path, &expected).expect("temp file should write");
@@ -815,15 +802,15 @@ mod tests {
         let mut host = Host::new();
         host.install_fs_read();
 
-        let program = Term::Perform {
-            op: Symbol::from("fs.read"),
-            args: vec![Term::Value(Value::Bytes(path_to_bytes(&path)))],
-        };
+        let program = fs::read(path_to_bytes(&path));
 
         let result = runtime.run(program, &mut host).expect("program should run");
 
         match result {
-            RuntimeValue::Data(Value::Bytes(bytes)) => assert_eq!(bytes, expected),
+            RuntimeValue::Data(value) => {
+                let decoded = fs::decode_read_result(&value).expect("result should decode");
+                assert_eq!(decoded, fs::ReadResult::Ok { contents: expected });
+            }
             other => panic!("unexpected result: {other:?}"),
         }
 
@@ -831,7 +818,35 @@ mod tests {
     }
 
     #[test]
-    fn fs_write_runs_end_to_end() {
+    fn fs_read_accepts_legacy_bytes_argument_shape() {
+        let path = unique_temp_path("r2-fs-read-legacy");
+        let expected = b"legacy".to_vec();
+        std::fs::write(&path, &expected).expect("temp file should write");
+
+        let mut runtime = Runtime::new();
+        let mut host = Host::new();
+        host.install_fs_read();
+
+        let program = Term::Perform {
+            op: Symbol::from(FS_READ_OP),
+            args: vec![Term::Value(Value::Bytes(path_to_bytes(&path)))],
+        };
+
+        let result = runtime.run(program, &mut host).expect("program should run");
+
+        match result {
+            RuntimeValue::Data(value) => {
+                let decoded = fs::decode_read_result(&value).expect("result should decode");
+                assert_eq!(decoded, fs::ReadResult::Ok { contents: expected });
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn fs_write_runs_end_to_end_with_explicit_result_shape() {
         let path = unique_temp_path("r2-fs-write");
         let expected = b"hello from write".to_vec();
 
@@ -839,25 +854,53 @@ mod tests {
         let mut host = Host::new();
         host.install_fs_write();
 
-        let program = Term::Perform {
-            op: Symbol::from("fs.write"),
-            args: vec![
-                Term::Value(Value::Bytes(path_to_bytes(&path))),
-                Term::Value(Value::Bytes(expected.clone())),
-            ],
-        };
+        let program = fs::write(path_to_bytes(&path), expected.clone());
 
         let result = runtime.run(program, &mut host).expect("program should run");
 
         match result {
-            RuntimeValue::Data(Value::Integer(written)) => {
-                assert_eq!(written, i64::try_from(expected.len()).unwrap())
+            RuntimeValue::Data(value) => {
+                let decoded = fs::decode_write_result(&value).expect("result should decode");
+                assert_eq!(
+                    decoded,
+                    fs::WriteResult::Ok {
+                        written: i64::try_from(expected.len()).unwrap()
+                    }
+                );
             }
             other => panic!("unexpected result: {other:?}"),
         }
         assert_eq!(std::fs::read(&path).unwrap(), expected);
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn fs_read_not_found_returns_typed_error_result() {
+        let path = unique_temp_path("r2-fs-read-missing");
+        let expected_message = std::fs::read(&path).unwrap_err().to_string();
+
+        let mut runtime = Runtime::new();
+        let mut host = Host::new();
+        host.install_fs_read();
+
+        let result = runtime
+            .run(fs::read(path_to_bytes(&path)), &mut host)
+            .expect("program should run");
+
+        match result {
+            RuntimeValue::Data(value) => {
+                let decoded = fs::decode_read_result(&value).expect("result should decode");
+                assert_eq!(
+                    decoded,
+                    fs::ReadResult::Error(fs::ErrorResult {
+                        kind: fs::ErrorKind::NotFound,
+                        message: expected_message,
+                    })
+                );
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
     }
 
     #[test]

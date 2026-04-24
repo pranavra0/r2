@@ -37,10 +37,10 @@ fn usage() -> &'static str {
 
 fn run_file(args: impl Iterator<Item = String>, force_trace: bool) -> Result<(), String> {
     let parsed = parse_run_args(args, force_trace)?;
-    let source =
-        fs::read_to_string(&parsed.path).map_err(|error| format!("failed to read {}: {error}", parsed.path))?;
-    let term =
-        parse_program(&source).map_err(|error| format!("failed to parse {}: {error}", parsed.path))?;
+    let source = fs::read_to_string(&parsed.path)
+        .map_err(|error| format!("failed to read {}: {error}", parsed.path))?;
+    let term = parse_program(&source)
+        .map_err(|error| format!("failed to parse {}: {error}", parsed.path))?;
 
     let mut runtime = Runtime::new();
     let mut host = Host::new();
@@ -70,7 +70,10 @@ struct ParsedRunArgs {
     summary_requested: bool,
 }
 
-fn parse_run_args(args: impl Iterator<Item = String>, force_trace: bool) -> Result<ParsedRunArgs, String> {
+fn parse_run_args(
+    args: impl Iterator<Item = String>,
+    force_trace: bool,
+) -> Result<ParsedRunArgs, String> {
     let mut trace_requested = force_trace;
     let mut summary_requested = false;
     let mut path = None;

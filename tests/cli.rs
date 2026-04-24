@@ -37,7 +37,7 @@ fn writes_files_through_the_default_host() {
         .expect("cli should run");
 
     assert!(output.status.success(), "stderr: {}", stderr(&output));
-    assert_eq!(String::from_utf8(output.stdout).unwrap(), "14\n");
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), "ok({written: 14})\n");
     assert_eq!(
         std::fs::read_to_string(&target_path).unwrap(),
         "hello from cli"
@@ -131,7 +131,10 @@ fn process_spawn_materializes_declared_outputs() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("output_files"), "{stdout}");
     assert!(stdout.contains("hello from child"), "{stdout}");
-    assert!(stdout.contains(output_path.to_string_lossy().as_ref()), "{stdout}");
+    assert!(
+        stdout.contains(output_path.to_string_lossy().as_ref()),
+        "{stdout}"
+    );
 
     let _ = std::fs::remove_file(parent_program_path);
     let _ = std::fs::remove_file(child_program_path);
@@ -141,8 +144,11 @@ fn process_spawn_materializes_declared_outputs() {
 #[test]
 fn trace_command_reports_pure_thunk_cache_hits() {
     let program_path = unique_temp_path("r2-cli-program-trace-pure", "r2");
-    std::fs::write(&program_path, "let thunk = lazy { 5 }; let _ = force thunk; force thunk")
-        .expect("program should write");
+    std::fs::write(
+        &program_path,
+        "let thunk = lazy { 5 }; let _ = force thunk; force thunk",
+    )
+    .expect("program should write");
 
     let output = Command::new(env!("CARGO_BIN_EXE_r2"))
         .arg("trace")
@@ -182,7 +188,7 @@ fn trace_command_reports_runtime_and_volatile_thunk_activity() {
     assert!(output.status.success(), "stderr: {}", stderr(&output));
 
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains("result: 5\n"), "{stdout}");
+    assert!(stdout.contains("result: ok({written: 5})\n"), "{stdout}");
     assert!(stdout.contains("trace:\n"), "{stdout}");
     assert!(stdout.contains("yield: thunk.force"), "{stdout}");
     assert!(stdout.contains("builtin handle: thunk.force"), "{stdout}");
@@ -218,7 +224,10 @@ fn trace_command_reports_process_spawn_activity() {
 
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("yield: process.spawn"), "{stdout}");
-    assert!(stdout.contains("host handle: process.spawn [declared]"), "{stdout}");
+    assert!(
+        stdout.contains("host handle: process.spawn [declared]"),
+        "{stdout}"
+    );
     assert!(stdout.contains("result: ok({"), "{stdout}");
 
     let _ = std::fs::remove_file(program_path);
@@ -227,8 +236,11 @@ fn trace_command_reports_process_spawn_activity() {
 #[test]
 fn trace_command_can_print_a_summary() {
     let program_path = unique_temp_path("r2-cli-program-trace-summary", "r2");
-    std::fs::write(&program_path, "let thunk = lazy { 5 }; let _ = force thunk; force thunk")
-        .expect("program should write");
+    std::fs::write(
+        &program_path,
+        "let thunk = lazy { 5 }; let _ = force thunk; force thunk",
+    )
+    .expect("program should write");
 
     let output = Command::new(env!("CARGO_BIN_EXE_r2"))
         .arg("trace")
@@ -249,7 +261,10 @@ fn trace_command_can_print_a_summary() {
         stdout.contains("- host handles: 0 (stable: 0, volatile: 0, declared: 0, hermetic: 0)"),
         "{stdout}"
     );
-    assert!(stdout.contains("- thunk cache: hits 1, stores 1, bypasses 0"), "{stdout}");
+    assert!(
+        stdout.contains("- thunk cache: hits 1, stores 1, bypasses 0"),
+        "{stdout}"
+    );
     assert!(stdout.contains("trace:\n"), "{stdout}");
 
     let _ = std::fs::remove_file(program_path);

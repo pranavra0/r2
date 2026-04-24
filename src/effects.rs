@@ -133,7 +133,9 @@ pub mod fs {
             "ok" => Ok(ReadResult::Ok {
                 contents: decode_bytes(required_field(record, "contents", "fs.read")?, "contents")?,
             }),
-            _ => Ok(ReadResult::Error(decode_error_result(tag, record, "fs.read")?)),
+            _ => Ok(ReadResult::Error(decode_error_result(
+                tag, record, "fs.read",
+            )?)),
         }
     }
 
@@ -143,7 +145,9 @@ pub mod fs {
             "ok" => Ok(WriteResult::Ok {
                 written: decode_integer(required_field(record, "written", "fs.write")?, "written")?,
             }),
-            _ => Ok(WriteResult::Error(decode_error_result(tag, record, "fs.write")?)),
+            _ => Ok(WriteResult::Error(decode_error_result(
+                tag, record, "fs.write",
+            )?)),
         }
     }
 
@@ -181,10 +185,7 @@ pub mod fs {
         };
         Ok(ErrorResult {
             kind,
-            message: decode_string(
-                required_field(record, "message", effect_name)?,
-                "message",
-            )?,
+            message: decode_string(required_field(record, "message", effect_name)?, "message")?,
         })
     }
 
@@ -193,11 +194,9 @@ pub mod fs {
         name: &str,
         effect_name: &str,
     ) -> Result<&'a Value, DecodeError> {
-        record.get(&Symbol::from(name)).ok_or_else(|| {
-            DecodeError(format!(
-                "missing {effect_name} result field `{name}`"
-            ))
-        })
+        record
+            .get(&Symbol::from(name))
+            .ok_or_else(|| DecodeError(format!("missing {effect_name} result field `{name}`")))
     }
 
     fn decode_bytes(value: &Value, field: &str) -> Result<Vec<u8>, DecodeError> {
@@ -629,11 +628,11 @@ pub mod process {
 
 #[cfg(test)]
 mod tests {
+    use super::clock::{NowRequest, SleepRequest, decode_now_result, decode_sleep_result};
     use super::fs::{
         ErrorKind as FsErrorKind, ReadRequest, ReadResult, WriteRequest, WriteResult,
         decode_read_result, decode_write_result,
     };
-    use super::clock::{NowRequest, SleepRequest, decode_now_result, decode_sleep_result};
     use super::process::{DeclaredOutputFile, ProcessStatus, SpawnRequest, decode_result};
     use crate::{Symbol, Value};
     use std::collections::BTreeMap;
