@@ -9,6 +9,7 @@ fn runs_a_surface_language_program() {
 
     let output = Command::new(env!("CARGO_BIN_EXE_r2"))
         .arg("run")
+        .arg("--memory-store")
         .arg(&program_path)
         .output()
         .expect("cli should run");
@@ -32,12 +33,16 @@ fn writes_files_through_the_default_host() {
 
     let output = Command::new(env!("CARGO_BIN_EXE_r2"))
         .arg("run")
+        .arg("--memory-store")
         .arg(&program_path)
         .output()
         .expect("cli should run");
 
     assert!(output.status.success(), "stderr: {}", stderr(&output));
-    assert_eq!(String::from_utf8(output.stdout).unwrap(), "ok({written: 14})\n");
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "ok({written: 14})\n"
+    );
     assert_eq!(
         std::fs::read_to_string(&target_path).unwrap(),
         "hello from cli"
@@ -55,6 +60,7 @@ fn runs_clock_effects_through_the_default_host() {
 
     let output = Command::new(env!("CARGO_BIN_EXE_r2"))
         .arg("run")
+        .arg("--memory-store")
         .arg(&program_path)
         .output()
         .expect("cli should run");
@@ -81,6 +87,7 @@ fn runs_processes_through_the_default_host() {
 
     let output = Command::new(env!("CARGO_BIN_EXE_r2"))
         .arg("run")
+        .arg("--memory-store")
         .arg(&program_path)
         .output()
         .expect("cli should run");
@@ -122,6 +129,7 @@ fn process_spawn_materializes_declared_outputs() {
 
     let output = Command::new(env!("CARGO_BIN_EXE_r2"))
         .arg("run")
+        .arg("--memory-store")
         .arg(&parent_program_path)
         .output()
         .expect("cli should run");
@@ -152,6 +160,7 @@ fn trace_command_reports_pure_thunk_cache_hits() {
 
     let output = Command::new(env!("CARGO_BIN_EXE_r2"))
         .arg("trace")
+        .arg("--memory-store")
         .arg(&program_path)
         .output()
         .expect("cli should run");
@@ -181,6 +190,7 @@ fn trace_command_reports_runtime_and_volatile_thunk_activity() {
 
     let output = Command::new(env!("CARGO_BIN_EXE_r2"))
         .arg("trace")
+        .arg("--memory-store")
         .arg(&program_path)
         .output()
         .expect("cli should run");
@@ -216,6 +226,7 @@ fn trace_command_reports_process_spawn_activity() {
 
     let output = Command::new(env!("CARGO_BIN_EXE_r2"))
         .arg("trace")
+        .arg("--memory-store")
         .arg(&program_path)
         .output()
         .expect("cli should run");
@@ -244,6 +255,7 @@ fn trace_command_can_print_a_summary() {
 
     let output = Command::new(env!("CARGO_BIN_EXE_r2"))
         .arg("trace")
+        .arg("--memory-store")
         .arg("--summary")
         .arg(&program_path)
         .output()
@@ -270,6 +282,65 @@ fn trace_command_can_print_a_summary() {
     let _ = std::fs::remove_file(program_path);
 }
 
+#[test]
+fn file_store_persists_thunk_cache_across_cli_runs() {
+    let program_path = unique_temp_path("r2-cli-program-persistent-cache", "r2");
+    let store_path = unique_temp_dir("r2-cli-store");
+    std::fs::write(&program_path, "force lazy { 5 }").expect("program should write");
+
+    let first = Command::new(env!("CARGO_BIN_EXE_r2"))
+        .arg("run")
+        .arg("--store")
+        .arg(&store_path)
+        .arg(&program_path)
+        .output()
+        .expect("first cli run should execute");
+
+    assert!(first.status.success(), "stderr: {}", stderr(&first));
+    assert_eq!(String::from_utf8(first.stdout).unwrap(), "5\n");
+    assert!(
+        store_path.join("objects").exists(),
+        "store should contain object directory"
+    );
+    assert!(
+        has_files_under(&store_path.join("objects")),
+        "first run should persist at least one object"
+    );
+
+    let second = Command::new(env!("CARGO_BIN_EXE_r2"))
+        .arg("run")
+        .arg("--trace")
+        .arg("--store")
+        .arg(&store_path)
+        .arg(&program_path)
+        .output()
+        .expect("second cli run should execute");
+
+    assert!(second.status.success(), "stderr: {}", stderr(&second));
+
+    let stdout = String::from_utf8(second.stdout).unwrap();
+    assert!(stdout.contains("result: 5\n"), "{stdout}");
+    assert!(stdout.contains("thunk cache hit:"), "{stdout}");
+    assert!(!stdout.contains("thunk cache store:"), "{stdout}");
+
+    let _ = std::fs::remove_file(program_path);
+    let _ = std::fs::remove_dir_all(store_path);
+}
+
+#[test]
+fn help_mentions_store_flags() {
+    let output = Command::new(env!("CARGO_BIN_EXE_r2"))
+        .arg("--help")
+        .output()
+        .expect("cli help should run");
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("--store <path>"), "{stdout}");
+    assert!(stdout.contains("--memory-store"), "{stdout}");
+}
+
 fn unique_temp_path(prefix: &str, extension: &str) -> PathBuf {
     let mut path = std::env::temp_dir();
     let nanos = SystemTime::now()
@@ -281,6 +352,27 @@ fn unique_temp_path(prefix: &str, extension: &str) -> PathBuf {
         std::process::id()
     ));
     path
+}
+
+fn unique_temp_dir(prefix: &str) -> PathBuf {
+    let path = unique_temp_path(prefix, "dir");
+    let _ = std::fs::remove_dir_all(&path);
+    path
+}
+
+fn has_files_under(path: &std::path::Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return false;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_file() || has_files_under(&path) {
+            return true;
+        }
+    }
+
+    false
 }
 
 fn string_literal(value: &str) -> String {

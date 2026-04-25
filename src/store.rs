@@ -18,6 +18,14 @@ pub enum Stored {
     Value(Value),
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "ref", rename_all = "snake_case")]
+pub enum CachedThunk {
+    Value(Ref),
+    Lambda(Ref),
+    Ref(Ref),
+}
+
 impl Stored {
     pub fn term(term: Term) -> Self {
         Self::Term(term)
@@ -57,6 +65,10 @@ pub enum StoreError {
         path: PathBuf,
         source: serde_json::Error,
     },
+    CacheDecode {
+        path: PathBuf,
+        source: serde_json::Error,
+    },
     HashMismatch {
         path: PathBuf,
         expected: Digest,
@@ -86,6 +98,13 @@ impl fmt::Display for StoreError {
                     path.display()
                 )
             }
+            Self::CacheDecode { path, source } => {
+                write!(
+                    f,
+                    "failed to decode thunk cache entry {}: {source}",
+                    path.display()
+                )
+            }
             Self::HashMismatch {
                 path,
                 expected,
@@ -105,6 +124,7 @@ impl std::error::Error for StoreError {
             Self::Io { source, .. } => Some(source),
             Self::Encode(source) => Some(source),
             Self::Decode { source, .. } => Some(source),
+            Self::CacheDecode { source, .. } => Some(source),
             Self::OpenTerm | Self::MissingRef(_) | Self::HashMismatch { .. } => None,
         }
     }
@@ -113,6 +133,14 @@ impl std::error::Error for StoreError {
 pub trait ObjectStore {
     fn put(&mut self, object: Stored) -> Result<Ref, StoreError>;
     fn get(&self, reference: &Ref) -> Result<Option<Stored>, StoreError>;
+
+    fn put_cached_thunk(&mut self, _key: Digest, _cached: CachedThunk) -> Result<(), StoreError> {
+        Ok(())
+    }
+
+    fn get_cached_thunk(&self, _key: &Digest) -> Result<Option<CachedThunk>, StoreError> {
+        Ok(None)
+    }
 
     fn load(&self, reference: &Ref) -> Result<Stored, StoreError> {
         self.get(reference)
@@ -142,16 +170,23 @@ impl FileStore {
         self.root.join("objects")
     }
 
-    fn object_path(&self, hash: &Digest) -> PathBuf {
-        let rendered = hash.to_string();
-        self.objects_dir().join(&rendered[..2]).join(&rendered[2..])
+    fn thunk_cache_dir(&self) -> PathBuf {
+        self.root.join("cache").join("thunks")
     }
 
-    fn temp_path(&self, hash: &Digest) -> PathBuf {
-        let mut path = self.object_path(hash);
+    fn object_path(&self, hash: &Digest) -> PathBuf {
+        sharded_path(self.objects_dir(), hash)
+    }
+
+    fn thunk_cache_path(&self, key: &Digest) -> PathBuf {
+        sharded_path(self.thunk_cache_dir(), key)
+    }
+
+    fn temp_path(&self, path: &Path) -> PathBuf {
+        let mut path = path.to_path_buf();
         let file_name = path
             .file_name()
-            .expect("content-addressed object path should have a file name")
+            .expect("store path should have a file name")
             .to_string_lossy();
         let suffix = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
         path.set_file_name(format!(
@@ -175,6 +210,7 @@ impl FileStore {
 #[derive(Clone, Debug, Default)]
 pub struct MemoryStore {
     objects: BTreeMap<Digest, Stored>,
+    thunk_cache: BTreeMap<Digest, CachedThunk>,
 }
 
 impl MemoryStore {
@@ -189,6 +225,11 @@ impl MemoryStore {
     pub fn is_empty(&self) -> bool {
         self.objects.is_empty()
     }
+}
+
+fn sharded_path(root: PathBuf, hash: &Digest) -> PathBuf {
+    let rendered = hash.to_string();
+    root.join(&rendered[..2]).join(&rendered[2..])
 }
 
 fn reference_for(object: &Stored) -> Result<Ref, StoreError> {
@@ -212,7 +253,7 @@ impl ObjectStore for FileStore {
 
         self.ensure_parent_dir(&path)?;
         let encoded = serde_json::to_vec(&object).map_err(StoreError::Encode)?;
-        let temp_path = self.temp_path(&reference.hash);
+        let temp_path = self.temp_path(&path);
         let mut temp_file = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -261,6 +302,52 @@ impl ObjectStore for FileStore {
 
         Ok(Some(stored))
     }
+
+    fn put_cached_thunk(&mut self, key: Digest, cached: CachedThunk) -> Result<(), StoreError> {
+        let path = self.thunk_cache_path(&key);
+        self.ensure_parent_dir(&path)?;
+
+        let encoded = serde_json::to_vec(&cached).map_err(StoreError::Encode)?;
+        let temp_path = self.temp_path(&path);
+        let mut temp_file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+            .map_err(|source| {
+                StoreError::io("create temp thunk cache entry", temp_path.clone(), source)
+            })?;
+        temp_file.write_all(&encoded).map_err(|source| {
+            StoreError::io("write temp thunk cache entry", temp_path.clone(), source)
+        })?;
+        temp_file.sync_all().map_err(|source| {
+            StoreError::io("sync temp thunk cache entry", temp_path.clone(), source)
+        })?;
+
+        match fs::rename(&temp_path, &path) {
+            Ok(()) => Ok(()),
+            Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
+                let _ = fs::remove_file(&temp_path);
+                Ok(())
+            }
+            Err(source) => {
+                let _ = fs::remove_file(&temp_path);
+                Err(StoreError::io("install thunk cache entry", path, source))
+            }
+        }
+    }
+
+    fn get_cached_thunk(&self, key: &Digest) -> Result<Option<CachedThunk>, StoreError> {
+        let path = self.thunk_cache_path(key);
+        let encoded = match fs::read(&path) {
+            Ok(encoded) => encoded,
+            Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => return Err(StoreError::io("read thunk cache entry", path, source)),
+        };
+
+        serde_json::from_slice::<CachedThunk>(&encoded)
+            .map(Some)
+            .map_err(|source| StoreError::CacheDecode { path, source })
+    }
 }
 
 impl ObjectStore for MemoryStore {
@@ -273,6 +360,15 @@ impl ObjectStore for MemoryStore {
 
     fn get(&self, reference: &Ref) -> Result<Option<Stored>, StoreError> {
         Ok(self.objects.get(&reference.hash).cloned())
+    }
+
+    fn put_cached_thunk(&mut self, key: Digest, cached: CachedThunk) -> Result<(), StoreError> {
+        self.thunk_cache.insert(key, cached);
+        Ok(())
+    }
+
+    fn get_cached_thunk(&self, key: &Digest) -> Result<Option<CachedThunk>, StoreError> {
+        Ok(self.thunk_cache.get(key).cloned())
     }
 }
 

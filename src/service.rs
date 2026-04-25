@@ -226,10 +226,10 @@ impl RestartPolicy {
             return RestartDecision::Stop;
         }
 
-        if let Some(max_restarts) = self.max_restarts {
-            if restart_count >= max_restarts {
-                return RestartDecision::Stop;
-            }
+        if let Some(max_restarts) = self.max_restarts
+            && restart_count >= max_restarts
+        {
+            return RestartDecision::Stop;
         }
 
         match self.delay.sleep_request() {

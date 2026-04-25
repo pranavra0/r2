@@ -7,7 +7,7 @@ use crate::eval::{EvalError, EvalResult, Reified, RuntimeValue, Yielded, eval};
 use crate::host::{
     HostEffectCaching, HostEffectPolicy, HostEffectProvenance, HostError, HostHandler,
 };
-use crate::store::{MemoryStore, ObjectStore, StoreError, Stored};
+use crate::store::{CachedThunk, MemoryStore, ObjectStore, StoreError, Stored};
 use crate::thunk::{self, ThunkError};
 
 #[derive(Debug)]
@@ -670,6 +670,12 @@ impl<S: ObjectStore> Runtime<S> {
             return Ok(reified.into_runtime());
         }
 
+        if let Some(reified) = self.load_cached_thunk_with_trace(&key, trace)? {
+            self.thunk_cache.insert(key, reified.clone());
+            trace.record(RuntimeTraceEvent::ThunkCacheHit { key });
+            return Ok(reified.into_runtime());
+        }
+
         let outcome = self.run_with_trace_sink(term, host, trace)?;
 
         if !outcome.cacheable {
@@ -687,26 +693,55 @@ impl<S: ObjectStore> Runtime<S> {
             .ok_or(ThunkError::UncacheableResult)?
             .clone();
 
-        self.persist_reified_with_trace(&reified, trace)?;
+        self.persist_reified_with_trace(key, &reified, trace)?;
         self.thunk_cache.insert(key, reified.clone());
         trace.record(RuntimeTraceEvent::ThunkCacheStore { key });
         Ok(reified.into_runtime())
     }
 
+    fn load_cached_thunk_with_trace<T: TraceSink>(
+        &mut self,
+        key: &Digest,
+        trace: &mut T,
+    ) -> Result<Option<Reified>, RuntimeError> {
+        let Some(cached) = self.store.get_cached_thunk(key)? else {
+            return Ok(None);
+        };
+
+        let reified = match cached {
+            CachedThunk::Value(reference) => match self.load_with_trace(&reference, trace)? {
+                Stored::Value(value) => Reified::Value(value),
+                Stored::Term(_) => return Err(ThunkError::InvalidCacheEntry.into()),
+            },
+            CachedThunk::Lambda(reference) => match self.load_with_trace(&reference, trace)? {
+                Stored::Term(Term::Lambda(lambda)) => Reified::Lambda(lambda),
+                Stored::Term(_) | Stored::Value(_) => {
+                    return Err(ThunkError::InvalidCacheEntry.into());
+                }
+            },
+            CachedThunk::Ref(reference) => Reified::Ref(reference),
+        };
+
+        Ok(Some(reified))
+    }
+
     fn persist_reified_with_trace<T: TraceSink>(
         &mut self,
+        key: Digest,
         reified: &Reified,
         trace: &mut T,
     ) -> Result<(), RuntimeError> {
-        match reified {
+        let cached = match reified {
             Reified::Value(value) => {
-                self.intern_value_with_trace(value.clone(), trace)?;
+                CachedThunk::Value(self.intern_value_with_trace(value.clone(), trace)?)
             }
-            Reified::Lambda(lambda) => {
-                self.intern_term_with_trace(Term::Lambda(lambda.clone()), trace)?;
-            }
-            Reified::Ref(_) => {}
-        }
+            Reified::Lambda(lambda) => CachedThunk::Lambda(
+                self.intern_term_with_trace(Term::Lambda(lambda.clone()), trace)?,
+            ),
+            Reified::Ref(reference) => CachedThunk::Ref(reference.clone()),
+        };
+
+        self.store.put_cached_thunk(key, cached)?;
 
         Ok(())
     }
@@ -926,9 +961,7 @@ mod tests {
                 let mut value = counter.borrow_mut();
                 *value += 1;
                 continuation
-                    .resume(RuntimeValue::Data(Value::Integer(
-                        i64::try_from(*value).unwrap(),
-                    )))
+                    .resume(RuntimeValue::Data(Value::Integer(i64::from(*value))))
                     .map_err(Into::into)
             }
         });

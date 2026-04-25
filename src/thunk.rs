@@ -10,6 +10,7 @@ pub enum ThunkError {
     NotAThunk,
     WrongArity { expected: usize, found: usize },
     UncacheableResult,
+    InvalidCacheEntry,
 }
 
 impl fmt::Display for ThunkError {
@@ -23,6 +24,9 @@ impl fmt::Display for ThunkError {
                 write!(f, "thunk expected arity {expected}, found {found}")
             }
             Self::UncacheableResult => f.write_str("thunk result could not be reified for caching"),
+            Self::InvalidCacheEntry => {
+                f.write_str("thunk cache entry did not point to a cacheable result")
+            }
         }
     }
 }

@@ -1,10 +1,11 @@
 use std::env;
 use std::fs;
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use r2::{
-    Host, Reified, Runtime, RuntimeTrace, RuntimeTraceSummary, RuntimeValue, TracedRun, Value,
-    parse_program,
+    FileStore, Host, ObjectStore, Reified, Runtime, RuntimeTrace, RuntimeTraceSummary,
+    RuntimeValue, TracedRun, Value, parse_program,
 };
 
 fn main() -> ExitCode {
@@ -32,7 +33,7 @@ fn run() -> Result<(), String> {
 }
 
 fn usage() -> &'static str {
-    "Usage: r2 run [--trace] [--summary] <file>\n       r2 trace [--summary] <file>\n       r2 --help"
+    "Usage: r2 run [--trace] [--summary] [--store <path>|--memory-store] <file>\n       r2 trace [--summary] [--store <path>|--memory-store] <file>\n       r2 --help\n\nStore defaults to $XDG_STATE_HOME/r2/store on Unix, %LOCALAPPDATA%\\r2\\store on Windows, or .r2-store."
 }
 
 fn run_file(args: impl Iterator<Item = String>, force_trace: bool) -> Result<(), String> {
@@ -42,7 +43,23 @@ fn run_file(args: impl Iterator<Item = String>, force_trace: bool) -> Result<(),
     let term = parse_program(&source)
         .map_err(|error| format!("failed to parse {}: {error}", parsed.path))?;
 
-    let mut runtime = Runtime::new();
+    if parsed.memory_store {
+        let mut runtime = Runtime::new();
+        run_term(term, &mut runtime, &parsed)
+    } else {
+        let store_path = parsed.store_path.clone().unwrap_or_else(default_store_path);
+        let store = FileStore::open(&store_path)
+            .map_err(|error| format!("failed to open store {}: {error}", store_path.display()))?;
+        let mut runtime = Runtime::with_store(store);
+        run_term(term, &mut runtime, &parsed)
+    }
+}
+
+fn run_term<S: ObjectStore>(
+    term: r2::Term,
+    runtime: &mut Runtime<S>,
+    parsed: &ParsedRunArgs,
+) -> Result<(), String> {
     let mut host = Host::new();
     host.install_fs_read();
     host.install_fs_write();
@@ -68,6 +85,8 @@ struct ParsedRunArgs {
     path: String,
     trace_requested: bool,
     summary_requested: bool,
+    store_path: Option<PathBuf>,
+    memory_store: bool,
 }
 
 fn parse_run_args(
@@ -76,9 +95,12 @@ fn parse_run_args(
 ) -> Result<ParsedRunArgs, String> {
     let mut trace_requested = force_trace;
     let mut summary_requested = false;
+    let mut store_path = None;
+    let mut memory_store = false;
     let mut path = None;
 
-    for arg in args {
+    let mut args = args.peekable();
+    while let Some(arg) = args.next() {
         if !force_trace && arg == "--trace" {
             trace_requested = true;
             continue;
@@ -89,6 +111,31 @@ fn parse_run_args(
             continue;
         }
 
+        if arg == "--memory-store" {
+            memory_store = true;
+            continue;
+        }
+
+        if arg == "--store" {
+            let Some(value) = args.next() else {
+                return Err(format!("expected path after --store\n\n{}", usage()));
+            };
+            store_path = Some(PathBuf::from(value));
+            continue;
+        }
+
+        if let Some(value) = arg.strip_prefix("--store=") {
+            if value.is_empty() {
+                return Err(format!("expected path after --store=\n\n{}", usage()));
+            }
+            store_path = Some(PathBuf::from(value));
+            continue;
+        }
+
+        if arg.starts_with("--") {
+            return Err(format!("unknown flag `{arg}`\n\n{}", usage()));
+        }
+
         if path.is_none() {
             path = Some(arg);
         } else {
@@ -96,12 +143,41 @@ fn parse_run_args(
         }
     }
 
+    if memory_store && store_path.is_some() {
+        return Err(format!(
+            "--store and --memory-store cannot be used together\n\n{}",
+            usage()
+        ));
+    }
+
     let path = path.ok_or_else(|| usage().to_string())?;
     Ok(ParsedRunArgs {
         path,
         trace_requested,
         summary_requested,
+        store_path,
+        memory_store,
     })
+}
+
+fn default_store_path() -> PathBuf {
+    default_store_base()
+        .map(|base| base.join("r2").join("store"))
+        .unwrap_or_else(|| PathBuf::from(".r2-store"))
+}
+
+#[cfg(windows)]
+fn default_store_base() -> Option<PathBuf> {
+    env::var_os("LOCALAPPDATA")
+        .filter(|value| !value.as_os_str().is_empty())
+        .map(PathBuf::from)
+}
+
+#[cfg(not(windows))]
+fn default_store_base() -> Option<PathBuf> {
+    env::var_os("XDG_STATE_HOME")
+        .filter(|value| !value.as_os_str().is_empty())
+        .map(PathBuf::from)
 }
 
 fn print_traced_run(traced: &TracedRun, include_summary: bool) {

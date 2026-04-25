@@ -221,10 +221,10 @@ pub fn decode_runtime_value(value: &RuntimeValue) -> Result<ResultValue, DecodeE
 }
 
 pub fn decode_value(value: &Value) -> Result<ResultValue, DecodeError> {
-    if let Value::Tagged { tag, fields } = value {
-        if tag.as_str() == "error" {
-            return decode_error(fields);
-        }
+    if let Value::Tagged { tag, fields } = value
+        && tag.as_str() == "error"
+    {
+        return decode_error(fields);
     }
 
     let decoded = process::decode_result(value)?;
@@ -296,6 +296,8 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
+
+    type OutputFixture = (Vec<u8>, Result<Vec<u8>, String>);
 
     #[test]
     fn action_builds_process_request_with_explicit_artifacts() {
@@ -403,7 +405,7 @@ mod tests {
     fn ok_result(
         status: process::ProcessStatus,
         declared_inputs: Vec<Vec<u8>>,
-        outputs: Vec<(Vec<u8>, Result<Vec<u8>, String>)>,
+        outputs: Vec<OutputFixture>,
     ) -> Value {
         let declared_outputs = outputs
             .iter()
