@@ -151,6 +151,23 @@ pub trait HostHandler {
     }
 }
 
+pub(crate) fn materialize_cached_effect_outputs(value: &Value) -> Result<(), String> {
+    let Value::Tagged { tag, fields } = value else {
+        return Ok(());
+    };
+    if *tag != Symbol::from("ok") {
+        return Ok(());
+    }
+    let [Value::Record(record)] = fields.as_slice() else {
+        return Ok(());
+    };
+    if !record.contains_key(&Symbol::from("output_files")) {
+        return Ok(());
+    }
+
+    materialize_cached_outputs(value)
+}
+
 struct RegisteredHandler {
     handler: Box<Handler>,
     concurrent_handler: Option<Arc<ConcurrentHandler>>,
@@ -1132,7 +1149,7 @@ fn absolute_paths_in_argument(argument: &[u8]) -> Vec<PathBuf> {
     let mut index = 0;
 
     while index < bytes.len() {
-        if bytes[index] != b'/' {
+        if bytes[index] != b'/' || (index > 0 && !is_shell_path_boundary(bytes[index - 1])) {
             index += 1;
             continue;
         }
@@ -1318,8 +1335,42 @@ fn materialize_cached_outputs(value: &Value) -> Result<(), String> {
                 path.display()
             )
         })?;
+        apply_cached_output_mode(file, &path)?;
     }
 
+    Ok(())
+}
+
+#[cfg(unix)]
+fn apply_cached_output_mode(
+    record: &BTreeMap<Symbol, Value>,
+    path: &std::path::Path,
+) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Some(Value::Integer(mode)) = record.get(&Symbol::from("mode")) else {
+        return Ok(());
+    };
+    let mode = u32::try_from(*mode).map_err(|_| {
+        format!(
+            "process.spawn cached output {} had invalid mode {mode}",
+            path.display()
+        )
+    })?;
+    let permissions = std::fs::Permissions::from_mode(mode);
+    std::fs::set_permissions(path, permissions).map_err(|error| {
+        format!(
+            "process.spawn failed to restore cached output mode {}: {error}",
+            path.display()
+        )
+    })
+}
+
+#[cfg(not(unix))]
+fn apply_cached_output_mode(
+    _record: &BTreeMap<Symbol, Value>,
+    _path: &std::path::Path,
+) -> Result<(), String> {
     Ok(())
 }
 
@@ -1427,14 +1478,19 @@ fn declared_output_files_value(paths: &[Vec<u8>]) -> Value {
 }
 
 fn declared_output_file_value(path: Vec<u8>) -> Value {
+    let path_buf = path_from_bytes(path.clone());
     let mut record = BTreeMap::new();
     record.insert(Symbol::from("path"), Value::Bytes(path.clone()));
-    record.insert(Symbol::from("contents"), read_declared_output_value(path));
+    record.insert(
+        Symbol::from("contents"),
+        read_declared_output_value(&path_buf),
+    );
+    insert_declared_output_mode(&mut record, &path_buf);
     Value::Record(record)
 }
 
-fn read_declared_output_value(path: Vec<u8>) -> Value {
-    match std::fs::read(path_from_bytes(path)) {
+fn read_declared_output_value(path: &std::path::Path) -> Value {
+    match std::fs::read(path) {
         Ok(bytes) => Value::Tagged {
             tag: Symbol::from("ok"),
             fields: vec![Value::Bytes(bytes)],
@@ -1445,6 +1501,21 @@ fn read_declared_output_value(path: Vec<u8>) -> Value {
         },
     }
 }
+
+#[cfg(unix)]
+fn insert_declared_output_mode(record: &mut BTreeMap<Symbol, Value>, path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    if let Ok(metadata) = std::fs::metadata(path) {
+        record.insert(
+            Symbol::from("mode"),
+            Value::Integer(i64::from(metadata.permissions().mode())),
+        );
+    }
+}
+
+#[cfg(not(unix))]
+fn insert_declared_output_mode(_record: &mut BTreeMap<Symbol, Value>, _path: &std::path::Path) {}
 
 fn required_field<'a>(
     request: &'a BTreeMap<Symbol, Value>,

@@ -10,7 +10,7 @@ use crate::data::{Digest, Ref, Symbol, Term, Value};
 use crate::eval::{Continuation, EvalError, EvalResult, Reified, RuntimeValue, Yielded, eval};
 use crate::host::{
     HostEffectCaching, HostEffectPolicy, HostEffectProvenance, HostError, HostHandler,
-    HostTraceEvent,
+    HostTraceEvent, materialize_cached_effect_outputs,
 };
 use crate::store::{CachedThunk, MemoryStore, ObjectStore, StoreError, Stored};
 use crate::thunk::{self, ThunkError};
@@ -25,6 +25,7 @@ pub enum RuntimeError {
     Host(HostError),
     Thunk(ThunkError),
     UnhandledEffect { op: Symbol },
+    CachedOutputMaterialization { message: String },
     Cancelled,
 }
 
@@ -36,6 +37,9 @@ impl fmt::Display for RuntimeError {
             Self::Host(error) => error.fmt(f),
             Self::Thunk(error) => error.fmt(f),
             Self::UnhandledEffect { op } => write!(f, "unhandled effect {op}"),
+            Self::CachedOutputMaterialization { message } => {
+                write!(f, "cached output materialization failed: {message}")
+            }
             Self::Cancelled => f.write_str("cancelled"),
         }
     }
@@ -1247,11 +1251,13 @@ impl<S: ObjectStore> Runtime<S> {
         trace.record(RuntimeTraceEvent::ThunkForce { key });
 
         if let Some(reified) = self.get_thunk_cache(&key) {
+            materialize_reified_cached_effect_outputs(&reified)?;
             trace.record(RuntimeTraceEvent::ThunkCacheHit { key });
             return Ok(ForcedThunk::cacheable(reified.into_runtime()));
         }
 
         if let Some(reified) = self.load_cached_thunk_with_trace(&key, trace)? {
+            materialize_reified_cached_effect_outputs(&reified)?;
             self.insert_thunk_cache(key, reified.clone());
             trace.record(RuntimeTraceEvent::ThunkCacheHit { key });
             return Ok(ForcedThunk::cacheable(reified.into_runtime()));
@@ -1373,6 +1379,15 @@ fn reified_thunk_term(thunk_value: &RuntimeValue) -> Result<(Digest, Term), Thun
         }
         Some(Reified::Value(_)) | Some(Reified::Ref(_)) | None => Err(ThunkError::NotAThunk),
     }
+}
+
+fn materialize_reified_cached_effect_outputs(reified: &Reified) -> Result<(), RuntimeError> {
+    let Reified::Value(value) = reified else {
+        return Ok(());
+    };
+
+    materialize_cached_effect_outputs(value)
+        .map_err(|message| RuntimeError::CachedOutputMaterialization { message })
 }
 
 impl Stored {
