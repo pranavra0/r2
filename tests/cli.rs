@@ -283,6 +283,28 @@ fn trace_command_can_print_a_summary() {
 }
 
 #[test]
+fn trace_command_reports_stable_math_effects() {
+    let program_path = unique_temp_path("r2-cli-program-trace-math", "r2");
+    std::fs::write(&program_path, "2 + 3").expect("program should write");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_r2"))
+        .arg("trace")
+        .arg("--memory-store")
+        .arg(&program_path)
+        .output()
+        .expect("cli should run");
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("result: 5\n"), "{stdout}");
+    assert!(stdout.contains("yield: math.add"), "{stdout}");
+    assert!(stdout.contains("host handle: math.add [stable]"), "{stdout}");
+
+    let _ = std::fs::remove_file(program_path);
+}
+
+#[test]
 fn file_store_persists_thunk_cache_across_cli_runs() {
     let program_path = unique_temp_path("r2-cli-program-persistent-cache", "r2");
     let store_path = unique_temp_dir("r2-cli-store");

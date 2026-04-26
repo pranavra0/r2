@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::rc::Rc;
 
-use crate::{Lambda, Ref, Symbol, Term, Value, VarIndex};
+use crate::{CaseBranch, Lambda, Pattern, RecBinding, Ref, Symbol, Term, Value, VarIndex};
 
 type Env = Vec<RuntimeValue>;
 
@@ -11,6 +11,7 @@ type Env = Vec<RuntimeValue>;
 pub enum RuntimeValue {
     Data(Value),
     Closure(Closure),
+    RecursiveClosure(RecursiveClosure),
     Continuation(Continuation),
     Ref(Ref),
 }
@@ -27,6 +28,7 @@ impl RuntimeValue {
         match self {
             Self::Data(value) => Some(Reified::Value(value.clone())),
             Self::Closure(closure) => Some(Reified::Lambda(closure.reify()?)),
+            Self::RecursiveClosure(_) => None,
             Self::Continuation(_) => None,
             Self::Ref(reference) => Some(Reified::Ref(reference.clone())),
         }
@@ -38,6 +40,7 @@ impl fmt::Debug for RuntimeValue {
         match self {
             Self::Data(value) => f.debug_tuple("Data").field(value).finish(),
             Self::Closure(closure) => closure.fmt(f),
+            Self::RecursiveClosure(closure) => closure.fmt(f),
             Self::Continuation(continuation) => continuation.fmt(f),
             Self::Ref(reference) => f.debug_tuple("Ref").field(reference).finish(),
         }
@@ -75,6 +78,33 @@ impl fmt::Debug for Closure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Closure")
             .field("parameters", &self.lambda.parameters)
+            .field("env_len", &self.env.len())
+            .finish()
+    }
+}
+
+#[derive(Clone)]
+pub struct RecursiveClosure {
+    bindings: Rc<Vec<RecBinding>>,
+    index: usize,
+    env: Env,
+}
+
+impl RecursiveClosure {
+    fn new(bindings: Rc<Vec<RecBinding>>, index: usize, env: Env) -> Self {
+        Self {
+            bindings,
+            index,
+            env,
+        }
+    }
+}
+
+impl fmt::Debug for RecursiveClosure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RecursiveClosure")
+            .field("index", &self.index)
+            .field("bindings", &self.bindings.len())
             .field("env_len", &self.env.len())
             .finish()
     }
@@ -167,6 +197,10 @@ enum Frame {
         evaluated: Vec<RuntimeValue>,
         env: Env,
     },
+    CaseScrutinee {
+        branches: Vec<CaseBranch>,
+        env: Env,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -218,6 +252,7 @@ pub enum EvalError {
     UnboundVariable { index: VarIndex, env_len: usize },
     NonCallable(RuntimeValue),
     WrongArity { expected: usize, found: usize },
+    UnmatchedCase { shape: String },
     ContinuationAlreadyResumed,
     EmptyScopeStack,
 }
@@ -238,6 +273,9 @@ impl fmt::Display for EvalError {
             }
             Self::WrongArity { expected, found } => {
                 write!(f, "wrong arity: expected {expected}, found {found}")
+            }
+            Self::UnmatchedCase { shape } => {
+                write!(f, "unmatched case for {shape}")
             }
             Self::ContinuationAlreadyResumed => {
                 f.write_str("continuations are one-shot and may only be resumed once")
@@ -357,6 +395,28 @@ impl Machine {
             Term::Ref(reference) => {
                 self.control = Control::Value(RuntimeValue::Ref(reference));
             }
+            Term::Rec { bindings, body } => {
+                let bindings = Rc::new(bindings);
+                let mut rec_env = env.clone();
+                rec_env.extend((0..bindings.len()).map(|index| {
+                    RuntimeValue::RecursiveClosure(RecursiveClosure::new(
+                        bindings.clone(),
+                        index,
+                        env.clone(),
+                    ))
+                }));
+                self.control = Control::Term(*body, rec_env);
+            }
+            Term::Case {
+                scrutinee,
+                branches,
+            } => {
+                self.push_frame(Frame::CaseScrutinee {
+                    branches,
+                    env: env.clone(),
+                })?;
+                self.control = Control::Term(*scrutinee, env);
+            }
         }
 
         Ok(None)
@@ -429,6 +489,16 @@ impl Machine {
                     return self.handle_perform(op, evaluated);
                 }
             }
+            Frame::CaseScrutinee { branches, env } => {
+                let Some((body, bindings)) = select_case_branch(&branches, &value)? else {
+                    return Err(EvalError::UnmatchedCase {
+                        shape: value_shape(&value),
+                    });
+                };
+                let mut branch_env = env;
+                branch_env.extend(bindings);
+                self.control = Control::Term(body, branch_env);
+            }
         }
 
         Ok(None)
@@ -450,6 +520,26 @@ impl Machine {
                 let mut env = closure.env;
                 env.extend(args);
                 self.control = Control::Term(*closure.lambda.body, env);
+                Ok(())
+            }
+            RuntimeValue::RecursiveClosure(closure) => {
+                let lambda = closure.bindings[closure.index].lambda.clone();
+                let expected = usize::from(lambda.parameters);
+                let found = args.len();
+                if expected != found {
+                    return Err(EvalError::WrongArity { expected, found });
+                }
+
+                let mut env = closure.env.clone();
+                env.extend((0..closure.bindings.len()).map(|index| {
+                    RuntimeValue::RecursiveClosure(RecursiveClosure::new(
+                        closure.bindings.clone(),
+                        index,
+                        closure.env.clone(),
+                    ))
+                }));
+                env.extend(args);
+                self.control = Control::Term(*lambda.body, env);
                 Ok(())
             }
             RuntimeValue::Continuation(continuation) => {
@@ -587,6 +677,113 @@ fn close_term(term: &Term, depth: u32, captured: &[Term]) -> Option<Term> {
                 .collect::<Option<BTreeMap<_, _>>>()?,
         }),
         Term::Ref(reference) => Some(Term::Ref(reference.clone())),
+        Term::Rec { bindings, body } => {
+            let rec_depth = depth.saturating_add(
+                u32::try_from(bindings.len()).expect("binding count should fit into u32"),
+            );
+            Some(Term::Rec {
+                bindings: bindings
+                    .iter()
+                    .map(|binding| {
+                        Some(RecBinding::new(Lambda::new(
+                            binding.lambda.parameters,
+                            close_term(
+                                &binding.lambda.body,
+                                rec_depth.saturating_add(u32::from(binding.lambda.parameters)),
+                                captured,
+                            )?,
+                        )))
+                    })
+                    .collect::<Option<Vec<_>>>()?,
+                body: Box::new(close_term(body, rec_depth, captured)?),
+            })
+        }
+        Term::Case {
+            scrutinee,
+            branches,
+        } => Some(Term::Case {
+            scrutinee: Box::new(close_term(scrutinee, depth, captured)?),
+            branches: branches
+                .iter()
+                .map(|branch| {
+                    Some(CaseBranch::new(
+                        branch.pattern.clone(),
+                        close_term(
+                            &branch.body,
+                            depth.saturating_add(branch.pattern.bindings()),
+                            captured,
+                        )?,
+                    ))
+                })
+                .collect::<Option<Vec<_>>>()?,
+        }),
+    }
+}
+
+fn select_case_branch(
+    branches: &[CaseBranch],
+    value: &RuntimeValue,
+) -> Result<Option<(Term, Vec<RuntimeValue>)>, EvalError> {
+    let RuntimeValue::Data(value) = value else {
+        return Ok(None);
+    };
+
+    for branch in branches {
+        let mut bindings = Vec::new();
+        if match_pattern(&branch.pattern, value, &mut bindings) {
+            return Ok(Some((branch.body.clone(), bindings)));
+        }
+    }
+
+    Ok(None)
+}
+
+fn match_pattern(pattern: &Pattern, value: &Value, bindings: &mut Vec<RuntimeValue>) -> bool {
+    match pattern {
+        Pattern::Wildcard => true,
+        Pattern::Bind => {
+            bindings.push(RuntimeValue::Data(value.clone()));
+            true
+        }
+        Pattern::Symbol(expected) => matches!(value, Value::Symbol(actual) if actual == expected),
+        Pattern::Tagged { tag, fields } => {
+            let Value::Tagged {
+                tag: actual_tag,
+                fields: actual_fields,
+            } = value
+            else {
+                return false;
+            };
+
+            if actual_tag != tag || actual_fields.len() != fields.len() {
+                return false;
+            }
+
+            let checkpoint = bindings.len();
+            for (pattern, value) in fields.iter().zip(actual_fields) {
+                if !match_pattern(pattern, value, bindings) {
+                    bindings.truncate(checkpoint);
+                    return false;
+                }
+            }
+            true
+        }
+    }
+}
+
+fn value_shape(value: &RuntimeValue) -> String {
+    match value {
+        RuntimeValue::Data(Value::Symbol(symbol)) => format!("symbol :{symbol}"),
+        RuntimeValue::Data(Value::Tagged { tag, fields }) => {
+            format!("tagged {tag}/{}", fields.len())
+        }
+        RuntimeValue::Data(Value::Integer(_)) => "integer".to_string(),
+        RuntimeValue::Data(Value::Bytes(_)) => "bytes".to_string(),
+        RuntimeValue::Data(Value::List(items)) => format!("list/{}", items.len()),
+        RuntimeValue::Data(Value::Record(entries)) => format!("record/{}", entries.len()),
+        RuntimeValue::Closure(_) | RuntimeValue::RecursiveClosure(_) => "closure".to_string(),
+        RuntimeValue::Continuation(_) => "continuation".to_string(),
+        RuntimeValue::Ref(_) => "ref".to_string(),
     }
 }
 

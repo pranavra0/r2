@@ -84,7 +84,7 @@ impl RuntimeValueKind {
     fn of(value: &RuntimeValue) -> Self {
         match value {
             RuntimeValue::Data(_) => Self::Data,
-            RuntimeValue::Closure(_) => Self::Closure,
+            RuntimeValue::Closure(_) | RuntimeValue::RecursiveClosure(_) => Self::Closure,
             RuntimeValue::Continuation(_) => Self::Continuation,
             RuntimeValue::Ref(_) => Self::Ref,
         }

@@ -283,6 +283,85 @@ impl Canonical for Lambda {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "data", rename_all = "snake_case")]
+pub enum Pattern {
+    Wildcard,
+    Bind,
+    Symbol(Symbol),
+    Tagged { tag: Symbol, fields: Vec<Pattern> },
+}
+
+impl Pattern {
+    pub fn bindings(&self) -> u32 {
+        match self {
+            Self::Wildcard | Self::Symbol(_) => 0,
+            Self::Bind => 1,
+            Self::Tagged { fields, .. } => fields
+                .iter()
+                .map(Self::bindings)
+                .fold(0_u32, u32::saturating_add),
+        }
+    }
+}
+
+impl Canonical for Pattern {
+    fn write_canonical(&self, out: &mut Vec<u8>) {
+        match self {
+            Self::Wildcard => out.push(0x30),
+            Self::Bind => out.push(0x31),
+            Self::Symbol(symbol) => {
+                out.push(0x32);
+                symbol.write_canonical(out);
+            }
+            Self::Tagged { tag, fields } => {
+                out.push(0x33);
+                tag.write_canonical(out);
+                write_len(out, fields.len());
+                for field in fields {
+                    field.write_canonical(out);
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CaseBranch {
+    pub pattern: Pattern,
+    pub body: Term,
+}
+
+impl CaseBranch {
+    pub fn new(pattern: Pattern, body: Term) -> Self {
+        Self { pattern, body }
+    }
+}
+
+impl Canonical for CaseBranch {
+    fn write_canonical(&self, out: &mut Vec<u8>) {
+        self.pattern.write_canonical(out);
+        self.body.write_canonical(out);
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecBinding {
+    pub lambda: Lambda,
+}
+
+impl RecBinding {
+    pub fn new(lambda: Lambda) -> Self {
+        Self { lambda }
+    }
+}
+
+impl Canonical for RecBinding {
+    fn write_canonical(&self, out: &mut Vec<u8>) {
+        self.lambda.write_canonical(out);
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 pub enum Term {
     // Variables are binding machinery for the IR, not a semantic primitive.
     Var(VarIndex),
@@ -301,6 +380,14 @@ pub enum Term {
         handlers: BTreeMap<Symbol, Term>,
     },
     Ref(Ref),
+    Rec {
+        bindings: Vec<RecBinding>,
+        body: Box<Term>,
+    },
+    Case {
+        scrutinee: Box<Term>,
+        branches: Vec<CaseBranch>,
+    },
 }
 
 impl Term {
@@ -332,6 +419,27 @@ impl Term {
                     && handlers.values().all(|handler| handler.is_closed_at(depth))
             }
             Self::Ref(_) => true,
+            Self::Rec { bindings, body } => {
+                let rec_depth = depth.saturating_add(
+                    u32::try_from(bindings.len()).expect("binding count should fit into u32"),
+                );
+                bindings.iter().all(|binding| {
+                    binding.lambda.body.is_closed_at(
+                        rec_depth.saturating_add(u32::from(binding.lambda.parameters)),
+                    )
+                }) && body.is_closed_at(rec_depth)
+            }
+            Self::Case {
+                scrutinee,
+                branches,
+            } => {
+                scrutinee.is_closed_at(depth)
+                    && branches.iter().all(|branch| {
+                        branch
+                            .body
+                            .is_closed_at(depth.saturating_add(branch.pattern.bindings()))
+                    })
+            }
         }
     }
 }
@@ -379,6 +487,25 @@ impl Canonical for Term {
             Self::Ref(reference) => {
                 out.push(0x16);
                 reference.write_canonical(out);
+            }
+            Self::Rec { bindings, body } => {
+                out.push(0x17);
+                write_len(out, bindings.len());
+                for binding in bindings {
+                    binding.write_canonical(out);
+                }
+                body.write_canonical(out);
+            }
+            Self::Case {
+                scrutinee,
+                branches,
+            } => {
+                out.push(0x18);
+                scrutinee.write_canonical(out);
+                write_len(out, branches.len());
+                for branch in branches {
+                    branch.write_canonical(out);
+                }
             }
         }
     }

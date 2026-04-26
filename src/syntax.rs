@@ -1,7 +1,7 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-use crate::{Symbol, Term, Value, thunk};
+use crate::{CaseBranch, Lambda, Pattern, RecBinding, Symbol, Term, Value, thunk};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SyntaxError {
@@ -74,14 +74,33 @@ enum TokenKind {
     Semicolon,
     Dot,
     Equal,
+    EqualEqual,
+    BangEqual,
+    Less,
+    LessEqual,
+    Greater,
+    GreaterEqual,
+    Plus,
+    Minus,
+    Star,
+    Slash,
+    Percent,
     Arrow,
     Let,
+    Rec,
     Fn,
     Perform,
     Handle,
     With,
+    Match,
+    If,
+    Then,
+    Else,
+    True,
+    False,
     Lazy,
     Force,
+    Underscore,
     Eof,
 }
 
@@ -102,14 +121,33 @@ impl TokenKind {
             Self::Semicolon => "`;`".to_string(),
             Self::Dot => "`.`".to_string(),
             Self::Equal => "`=`".to_string(),
+            Self::EqualEqual => "`==`".to_string(),
+            Self::BangEqual => "`!=`".to_string(),
+            Self::Less => "`<`".to_string(),
+            Self::LessEqual => "`<=`".to_string(),
+            Self::Greater => "`>`".to_string(),
+            Self::GreaterEqual => "`>=`".to_string(),
+            Self::Plus => "`+`".to_string(),
+            Self::Minus => "`-`".to_string(),
+            Self::Star => "`*`".to_string(),
+            Self::Slash => "`/`".to_string(),
+            Self::Percent => "`%`".to_string(),
             Self::Arrow => "`=>`".to_string(),
             Self::Let => "`let`".to_string(),
+            Self::Rec => "`rec`".to_string(),
             Self::Fn => "`fn`".to_string(),
             Self::Perform => "`perform`".to_string(),
             Self::Handle => "`handle`".to_string(),
             Self::With => "`with`".to_string(),
+            Self::Match => "`match`".to_string(),
+            Self::If => "`if`".to_string(),
+            Self::Then => "`then`".to_string(),
+            Self::Else => "`else`".to_string(),
+            Self::True => "`true`".to_string(),
+            Self::False => "`false`".to_string(),
             Self::Lazy => "`lazy`".to_string(),
             Self::Force => "`force`".to_string(),
+            Self::Underscore => "`_`".to_string(),
             Self::Eof => "end of input".to_string(),
         }
     }
@@ -126,11 +164,17 @@ enum ExprKind {
     Name(String),
     Integer(i64),
     Bytes(Vec<u8>),
+    Bool(bool),
+    Symbol(Symbol),
     List(Vec<Expr>),
     Record(Vec<(String, Expr)>),
     Let {
         name: String,
         value: Box<Expr>,
+        body: Box<Expr>,
+    },
+    LetRec {
+        bindings: Vec<RecExprBinding>,
         body: Box<Expr>,
     },
     Lambda {
@@ -141,6 +185,11 @@ enum ExprKind {
         callee: Box<Expr>,
         args: Vec<Expr>,
     },
+    Binary {
+        op: BinaryOp,
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
     Perform {
         op: Symbol,
         args: Vec<Expr>,
@@ -149,8 +198,90 @@ enum ExprKind {
         body: Box<Expr>,
         handlers: Vec<Handler>,
     },
+    Match {
+        scrutinee: Box<Expr>,
+        branches: Vec<MatchBranch>,
+    },
+    If {
+        condition: Box<Expr>,
+        then_branch: Box<Expr>,
+        else_branch: Box<Expr>,
+    },
     Lazy(Box<Expr>),
     Force(Box<Expr>),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BinaryOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Rem,
+    Eq,
+    NotEq,
+    Less,
+    LessEq,
+    Greater,
+    GreaterEq,
+}
+
+impl BinaryOp {
+    fn effect_op(self) -> Symbol {
+        match self {
+            Self::Add => Symbol::from("math.add"),
+            Self::Sub => Symbol::from("math.sub"),
+            Self::Mul => Symbol::from("math.mul"),
+            Self::Div => Symbol::from("math.div"),
+            Self::Rem => Symbol::from("math.rem"),
+            Self::Eq => Symbol::from("math.eq"),
+            Self::NotEq => Symbol::from("math.ne"),
+            Self::Less => Symbol::from("math.lt"),
+            Self::LessEq => Symbol::from("math.le"),
+            Self::Greater => Symbol::from("math.gt"),
+            Self::GreaterEq => Symbol::from("math.ge"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RecExprBinding {
+    name: String,
+    params: Vec<String>,
+    body: Expr,
+    span: Span,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MatchBranch {
+    pattern: ParsedPattern,
+    body: Expr,
+    span: Span,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ParsedPattern {
+    Wildcard,
+    Bind(String),
+    Symbol(Symbol),
+    Tagged {
+        tag: Symbol,
+        fields: Vec<ParsedPattern>,
+    },
+}
+
+impl ParsedPattern {
+    fn binding_names(&self, out: &mut Vec<String>) {
+        match self {
+            Self::Wildcard | Self::Symbol(_) => {}
+            Self::Bind(name) => out.push(name.clone()),
+            Self::Tagged { fields, .. } => {
+                for field in fields {
+                    field.binding_names(out);
+                }
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -275,10 +406,63 @@ impl<'a> Lexer<'a> {
                 if self.source[self.offset..].starts_with("=>") {
                     self.offset += 2;
                     TokenKind::Arrow
+                } else if self.source[self.offset..].starts_with("==") {
+                    self.offset += 2;
+                    TokenKind::EqualEqual
                 } else {
                     self.offset += 1;
                     TokenKind::Equal
                 }
+            }
+            '!' => {
+                if self.source[self.offset..].starts_with("!=") {
+                    self.offset += 2;
+                    TokenKind::BangEqual
+                } else {
+                    return Err(SyntaxError::new(
+                        self.source,
+                        start,
+                        "expected `!=`, found `!`",
+                    ));
+                }
+            }
+            '<' => {
+                if self.source[self.offset..].starts_with("<=") {
+                    self.offset += 2;
+                    TokenKind::LessEqual
+                } else {
+                    self.offset += 1;
+                    TokenKind::Less
+                }
+            }
+            '>' => {
+                if self.source[self.offset..].starts_with(">=") {
+                    self.offset += 2;
+                    TokenKind::GreaterEqual
+                } else {
+                    self.offset += 1;
+                    TokenKind::Greater
+                }
+            }
+            '+' => {
+                self.offset += 1;
+                TokenKind::Plus
+            }
+            '-' => {
+                self.offset += 1;
+                TokenKind::Minus
+            }
+            '*' => {
+                self.offset += 1;
+                TokenKind::Star
+            }
+            '/' => {
+                self.offset += 1;
+                TokenKind::Slash
+            }
+            '%' => {
+                self.offset += 1;
+                TokenKind::Percent
             }
             '"' => self.lex_string()?,
             '0'..='9' => self.lex_integer()?,
@@ -380,12 +564,20 @@ impl<'a> Lexer<'a> {
 
         match &self.source[start..self.offset] {
             "let" => TokenKind::Let,
+            "rec" => TokenKind::Rec,
             "fn" => TokenKind::Fn,
             "perform" => TokenKind::Perform,
             "handle" => TokenKind::Handle,
             "with" => TokenKind::With,
+            "match" => TokenKind::Match,
+            "if" => TokenKind::If,
+            "then" => TokenKind::Then,
+            "else" => TokenKind::Else,
+            "true" => TokenKind::True,
+            "false" => TokenKind::False,
             "lazy" => TokenKind::Lazy,
             "force" => TokenKind::Force,
+            "_" => TokenKind::Underscore,
             name => TokenKind::Ident(name.to_string()),
         }
     }
@@ -431,6 +623,9 @@ impl<'a> Parser<'a> {
         }
 
         let start = self.next().span;
+        if matches!(self.peek().kind, TokenKind::Rec) {
+            return self.parse_let_rec(start);
+        }
         let (name, _) = self.expect_ident()?;
         self.expect_token("`=`", |kind| matches!(kind, TokenKind::Equal))?;
         let value = self.parse_expr()?;
@@ -448,9 +643,55 @@ impl<'a> Parser<'a> {
         })
     }
 
+    fn parse_let_rec(&mut self, start: Span) -> Result<Expr, SyntaxError> {
+        self.expect_token("`rec`", |kind| matches!(kind, TokenKind::Rec))?;
+        let mut bindings = Vec::new();
+
+        loop {
+            bindings.push(self.parse_rec_binding()?);
+            if matches!(self.peek().kind, TokenKind::Comma) {
+                self.next();
+            } else {
+                break;
+            }
+        }
+
+        self.expect_token("`;`", |kind| matches!(kind, TokenKind::Semicolon))?;
+        let body = self.parse_expr()?;
+        let span = start.join(body.span);
+
+        Ok(Expr {
+            kind: ExprKind::LetRec {
+                bindings,
+                body: Box::new(body),
+            },
+            span,
+        })
+    }
+
+    fn parse_rec_binding(&mut self) -> Result<RecExprBinding, SyntaxError> {
+        let start = self.peek().span;
+        let (name, _) = self.expect_ident()?;
+        self.expect_token("`=`", |kind| matches!(kind, TokenKind::Equal))?;
+        self.expect_token("`fn`", |kind| matches!(kind, TokenKind::Fn))?;
+        self.expect_token("`(`", |kind| matches!(kind, TokenKind::LParen))?;
+        let params = self.parse_ident_list(|kind| matches!(kind, TokenKind::RParen))?;
+        self.expect_token("`)`", |kind| matches!(kind, TokenKind::RParen))?;
+        self.expect_token("`=>`", |kind| matches!(kind, TokenKind::Arrow))?;
+        let body = self.parse_expr()?;
+        let span = start.join(body.span);
+
+        Ok(RecExprBinding {
+            name,
+            params,
+            body,
+            span,
+        })
+    }
+
     fn parse_handle(&mut self) -> Result<Expr, SyntaxError> {
         if !matches!(self.peek().kind, TokenKind::Handle) {
-            return self.parse_fn();
+            return self.parse_if();
         }
 
         let start = self.next().span;
@@ -481,6 +722,116 @@ impl<'a> Parser<'a> {
             },
             span: start.join(end),
         })
+    }
+
+    fn parse_if(&mut self) -> Result<Expr, SyntaxError> {
+        if !matches!(self.peek().kind, TokenKind::If) {
+            return self.parse_match();
+        }
+
+        let start = self.next().span;
+        let condition = self.parse_expr()?;
+        self.expect_token("`then`", |kind| matches!(kind, TokenKind::Then))?;
+        let then_branch = self.parse_expr()?;
+        self.expect_token("`else`", |kind| matches!(kind, TokenKind::Else))?;
+        let else_branch = self.parse_expr()?;
+        let span = start.join(else_branch.span);
+
+        Ok(Expr {
+            kind: ExprKind::If {
+                condition: Box::new(condition),
+                then_branch: Box::new(then_branch),
+                else_branch: Box::new(else_branch),
+            },
+            span,
+        })
+    }
+
+    fn parse_match(&mut self) -> Result<Expr, SyntaxError> {
+        if !matches!(self.peek().kind, TokenKind::Match) {
+            return self.parse_fn();
+        }
+
+        let start = self.next().span;
+        let scrutinee = self.parse_expr()?;
+        self.expect_token("`{`", |kind| matches!(kind, TokenKind::LBrace))?;
+        let mut branches = Vec::new();
+
+        while !matches!(self.peek().kind, TokenKind::RBrace) {
+            branches.push(self.parse_match_branch()?);
+            if matches!(self.peek().kind, TokenKind::Semicolon) {
+                self.next();
+            } else {
+                break;
+            }
+        }
+
+        let end = self.expect_token("`}`", |kind| matches!(kind, TokenKind::RBrace))?;
+        Ok(Expr {
+            kind: ExprKind::Match {
+                scrutinee: Box::new(scrutinee),
+                branches,
+            },
+            span: start.join(end),
+        })
+    }
+
+    fn parse_match_branch(&mut self) -> Result<MatchBranch, SyntaxError> {
+        let start = self.peek().span;
+        let pattern = self.parse_pattern()?;
+        self.expect_token("`=>`", |kind| matches!(kind, TokenKind::Arrow))?;
+        let body = self.parse_expr()?;
+        let span = start.join(body.span);
+
+        Ok(MatchBranch {
+            pattern,
+            body,
+            span,
+        })
+    }
+
+    fn parse_pattern(&mut self) -> Result<ParsedPattern, SyntaxError> {
+        let token = self.next();
+        match token.kind {
+            TokenKind::Underscore => Ok(ParsedPattern::Wildcard),
+            TokenKind::Colon => {
+                let (name, _) = self.expect_symbol_name()?;
+                Ok(ParsedPattern::Symbol(Symbol::from(name)))
+            }
+            TokenKind::Ident(name) => {
+                if matches!(self.peek().kind, TokenKind::LParen) {
+                    self.next();
+                    let mut fields = Vec::new();
+                    if !matches!(self.peek().kind, TokenKind::RParen) {
+                        loop {
+                            fields.push(self.parse_pattern()?);
+                            if matches!(self.peek().kind, TokenKind::Comma) {
+                                self.next();
+                                if matches!(self.peek().kind, TokenKind::RParen) {
+                                    break;
+                                }
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                    self.expect_token("`)`", |kind| matches!(kind, TokenKind::RParen))?;
+                    Ok(ParsedPattern::Tagged {
+                        tag: Symbol::from(name),
+                        fields,
+                    })
+                } else {
+                    Ok(ParsedPattern::Bind(name))
+                }
+            }
+            TokenKind::True => Ok(ParsedPattern::Symbol(Symbol::from("true"))),
+            TokenKind::False => Ok(ParsedPattern::Symbol(Symbol::from("false"))),
+            other => Err(SyntaxError::new(
+                self.source,
+                token.span.start,
+                format!("expected a pattern, found {}", other.describe()),
+            )),
+        }
     }
 
     fn parse_handler(&mut self) -> Result<Handler, SyntaxError> {
@@ -586,6 +937,21 @@ impl<'a> Parser<'a> {
                 kind: ExprKind::Integer(value),
                 span: token.span,
             }),
+            TokenKind::True => Ok(Expr {
+                kind: ExprKind::Bool(true),
+                span: token.span,
+            }),
+            TokenKind::False => Ok(Expr {
+                kind: ExprKind::Bool(false),
+                span: token.span,
+            }),
+            TokenKind::Colon => {
+                let (name, end) = self.expect_symbol_name()?;
+                Ok(Expr {
+                    kind: ExprKind::Symbol(Symbol::from(name)),
+                    span: token.span.join(end),
+                })
+            }
             TokenKind::String(bytes) => Ok(Expr {
                 kind: ExprKind::Bytes(bytes),
                 span: token.span,
@@ -722,10 +1088,25 @@ impl<'a> Parser<'a> {
         let token = self.next();
         match token.kind {
             TokenKind::Ident(name) => Ok((name, token.span)),
+            TokenKind::Underscore => Ok(("_".to_string(), token.span)),
             other => Err(SyntaxError::new(
                 self.source,
                 token.span.start,
                 format!("expected identifier, found {}", other.describe()),
+            )),
+        }
+    }
+
+    fn expect_symbol_name(&mut self) -> Result<(String, Span), SyntaxError> {
+        let token = self.next();
+        match token.kind {
+            TokenKind::Ident(name) => Ok((name, token.span)),
+            TokenKind::True => Ok(("true".to_string(), token.span)),
+            TokenKind::False => Ok(("false".to_string(), token.span)),
+            other => Err(SyntaxError::new(
+                self.source,
+                token.span.start,
+                format!("expected symbol name, found {}", other.describe()),
             )),
         }
     }
@@ -779,6 +1160,12 @@ fn lower_expr(source: &str, expr: &Expr, env: &mut Vec<String>) -> Result<Term, 
         }
         ExprKind::Integer(value) => Ok(Term::Value(Value::Integer(*value))),
         ExprKind::Bytes(bytes) => Ok(Term::Value(Value::Bytes(bytes.clone()))),
+        ExprKind::Bool(value) => Ok(Term::Value(Value::Symbol(Symbol::from(if *value {
+            "true"
+        } else {
+            "false"
+        })))),
+        ExprKind::Symbol(symbol) => Ok(Term::Value(Value::Symbol(symbol.clone()))),
         ExprKind::List(_) | ExprKind::Record(_) => Ok(Term::Value(lower_value(source, expr)?)),
         ExprKind::Let { name, value, body } => {
             let lowered_value = lower_expr(source, value, env)?;
@@ -789,6 +1176,31 @@ fn lower_expr(source: &str, expr: &Expr, env: &mut Vec<String>) -> Result<Term, 
             Ok(Term::Apply {
                 callee: Box::new(Term::lambda(1, lowered_body)),
                 args: vec![lowered_value],
+            })
+        }
+        ExprKind::LetRec { bindings, body } => {
+            let mut seen = BTreeSet::new();
+            for binding in bindings {
+                if !seen.insert(binding.name.clone()) {
+                    return Err(SyntaxError::new(
+                        source,
+                        binding.span.start,
+                        format!("duplicate recursive binding `{}`", binding.name),
+                    ));
+                }
+            }
+
+            env.extend(bindings.iter().map(|binding| binding.name.clone()));
+            let lowered_bindings = bindings
+                .iter()
+                .map(|binding| lower_rec_binding(source, binding, env))
+                .collect::<Result<Vec<_>, _>>()?;
+            let lowered_body = lower_expr(source, body, env)?;
+            env.truncate(env.len() - bindings.len());
+
+            Ok(Term::Rec {
+                bindings: lowered_bindings,
+                body: Box::new(lowered_body),
             })
         }
         ExprKind::Lambda { params, body } => {
@@ -832,8 +1244,109 @@ fn lower_expr(source: &str, expr: &Expr, env: &mut Vec<String>) -> Result<Term, 
                 handlers: lowered_handlers,
             })
         }
+        ExprKind::Match {
+            scrutinee,
+            branches,
+        } => Ok(Term::Case {
+            scrutinee: Box::new(lower_expr(source, scrutinee, env)?),
+            branches: branches
+                .iter()
+                .map(|branch| lower_match_branch(source, branch, env))
+                .collect::<Result<Vec<_>, _>>()?,
+        }),
+        ExprKind::If {
+            condition,
+            then_branch,
+            else_branch,
+        } => Ok(Term::Case {
+            scrutinee: Box::new(lower_expr(source, condition, env)?),
+            branches: vec![
+                CaseBranch::new(
+                    Pattern::Symbol(Symbol::from("true")),
+                    lower_expr(source, then_branch, env)?,
+                ),
+                CaseBranch::new(
+                    Pattern::Symbol(Symbol::from("false")),
+                    lower_expr(source, else_branch, env)?,
+                ),
+            ],
+        }),
         ExprKind::Lazy(body) => Ok(thunk::delay(lower_expr(source, body, env)?)),
         ExprKind::Force(value) => Ok(thunk::force(lower_expr(source, value, env)?)),
+    }
+}
+
+fn lower_rec_binding(
+    source: &str,
+    binding: &RecExprBinding,
+    env: &mut Vec<String>,
+) -> Result<RecBinding, SyntaxError> {
+    let arity = u16::try_from(binding.params.len()).map_err(|_| {
+        SyntaxError::new(
+            source,
+            binding.span.start,
+            "recursive function has too many parameters",
+        )
+    })?;
+    env.extend(binding.params.iter().cloned());
+    let body = lower_expr(source, &binding.body, env)?;
+    env.truncate(env.len() - binding.params.len());
+    Ok(RecBinding::new(Lambda::new(arity, body)))
+}
+
+fn lower_match_branch(
+    source: &str,
+    branch: &MatchBranch,
+    env: &mut Vec<String>,
+) -> Result<CaseBranch, SyntaxError> {
+    let mut names = Vec::new();
+    branch.pattern.binding_names(&mut names);
+    reject_duplicate_pattern_names(source, branch.span.start, &names)?;
+
+    env.extend(names);
+    let body = lower_expr(source, &branch.body, env)?;
+    env.truncate(env.len() - branch.pattern.bindings_usize());
+
+    Ok(CaseBranch::new(lower_pattern(&branch.pattern), body))
+}
+
+fn reject_duplicate_pattern_names(
+    source: &str,
+    offset: usize,
+    names: &[String],
+) -> Result<(), SyntaxError> {
+    let mut seen = BTreeSet::new();
+    for name in names {
+        if !seen.insert(name) {
+            return Err(SyntaxError::new(
+                source,
+                offset,
+                format!("duplicate pattern binding `{name}`"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn lower_pattern(pattern: &ParsedPattern) -> Pattern {
+    match pattern {
+        ParsedPattern::Wildcard => Pattern::Wildcard,
+        ParsedPattern::Bind(_) => Pattern::Bind,
+        ParsedPattern::Symbol(symbol) => Pattern::Symbol(symbol.clone()),
+        ParsedPattern::Tagged { tag, fields } => Pattern::Tagged {
+            tag: tag.clone(),
+            fields: fields.iter().map(lower_pattern).collect(),
+        },
+    }
+}
+
+impl ParsedPattern {
+    fn bindings_usize(&self) -> usize {
+        match self {
+            Self::Wildcard | Self::Symbol(_) => 0,
+            Self::Bind(_) => 1,
+            Self::Tagged { fields, .. } => fields.iter().map(Self::bindings_usize).sum(),
+        }
     }
 }
 
@@ -860,6 +1373,12 @@ fn lower_value(source: &str, expr: &Expr) -> Result<Value, SyntaxError> {
     match &expr.kind {
         ExprKind::Integer(value) => Ok(Value::Integer(*value)),
         ExprKind::Bytes(bytes) => Ok(Value::Bytes(bytes.clone())),
+        ExprKind::Bool(value) => Ok(Value::Symbol(Symbol::from(if *value {
+            "true"
+        } else {
+            "false"
+        }))),
+        ExprKind::Symbol(symbol) => Ok(Value::Symbol(symbol.clone())),
         ExprKind::List(items) => Ok(Value::List(
             items
                 .iter()
@@ -896,15 +1415,21 @@ fn literal_restriction_name(expr: &Expr) -> &'static str {
     match expr.kind {
         ExprKind::Name(_) => "a variable reference",
         ExprKind::Let { .. } => "a let expression",
+        ExprKind::LetRec { .. } => "a recursive let expression",
         ExprKind::Lambda { .. } => "a function",
         ExprKind::Call { .. } => "a function call",
         ExprKind::Perform { .. } => "an effect request",
         ExprKind::Handle { .. } => "a handler block",
+        ExprKind::Match { .. } => "a match expression",
+        ExprKind::If { .. } => "an if expression",
         ExprKind::Lazy(_) => "a lazy block",
         ExprKind::Force(_) => "a force expression",
-        ExprKind::Integer(_) | ExprKind::Bytes(_) | ExprKind::List(_) | ExprKind::Record(_) => {
-            "this expression"
-        }
+        ExprKind::Integer(_)
+        | ExprKind::Bytes(_)
+        | ExprKind::Bool(_)
+        | ExprKind::Symbol(_)
+        | ExprKind::List(_)
+        | ExprKind::Record(_) => "this expression",
     }
 }
 

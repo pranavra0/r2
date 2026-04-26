@@ -15,7 +15,9 @@ pub use build::{
     ResultValue as BuildResult, Status as BuildStatus,
     decode_runtime_value as decode_build_runtime_value, decode_value as decode_build_value,
 };
-pub use data::{Canonical, Digest, Lambda, Ref, Symbol, Term, Value, VarIndex};
+pub use data::{
+    Canonical, CaseBranch, Digest, Lambda, Pattern, RecBinding, Ref, Symbol, Term, Value, VarIndex,
+};
 pub use eval::{Continuation, EvalError, EvalResult, Reified, RuntimeValue, Yielded, eval};
 pub use host::{
     Host, HostEffectCaching, HostEffectPolicy, HostEffectProvenance, HostError, HostHandler,

@@ -226,7 +226,7 @@ fn print_trace_summary(summary: &RuntimeTraceSummary) {
 fn format_runtime_value(value: &RuntimeValue) -> String {
     match value {
         RuntimeValue::Data(data) => format_value(data),
-        RuntimeValue::Closure(_) => match value.reify() {
+        RuntimeValue::Closure(_) | RuntimeValue::RecursiveClosure(_) => match value.reify() {
             Some(Reified::Lambda(lambda)) => format!("<lambda/{}>", lambda.parameters),
             _ => "<closure>".to_string(),
         },
