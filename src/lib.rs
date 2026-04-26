@@ -11,9 +11,11 @@ pub mod thunk;
 
 pub use build::{
     Action as BuildAction, Artifact as BuildArtifact, DecodeError as BuildDecodeError,
-    FinishedAction as FinishedBuildAction, MaterializedArtifact as MaterializedBuildArtifact,
-    ResultValue as BuildResult, Status as BuildStatus,
-    decode_runtime_value as decode_build_runtime_value, decode_value as decode_build_value,
+    FinishedAction as FinishedBuildAction, Graph as BuildGraph, GraphError as BuildGraphError,
+    GraphNode as BuildGraphNode, Handle as BuildHandle,
+    MaterializedArtifact as MaterializedBuildArtifact, ResultValue as BuildResult,
+    Status as BuildStatus, decode_runtime_value as decode_build_runtime_value,
+    decode_value as decode_build_value,
 };
 pub use data::{
     Canonical, CaseBranch, Digest, Lambda, Pattern, RecBinding, Ref, Symbol, Term, Value, VarIndex,

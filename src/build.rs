@@ -1,8 +1,8 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use crate::effects::process;
-use crate::{RuntimeValue, Symbol, Term, Value};
+use crate::{RuntimeValue, Symbol, Term, Value, thunk};
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Artifact {
@@ -118,6 +118,291 @@ impl Action {
 
     pub fn into_term(self) -> Term {
         self.to_spawn_request().into_term()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Handle(usize);
+
+impl Handle {
+    pub fn index(self) -> usize {
+        self.0
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GraphNode {
+    Input {
+        artifact: Artifact,
+    },
+    Action {
+        action: Action,
+        dependencies: Vec<Handle>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GraphError {
+    UnknownHandle(Handle),
+    DuplicateTarget(Symbol),
+    Cycle { handle: Handle },
+}
+
+impl fmt::Display for GraphError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnknownHandle(handle) => write!(f, "unknown build graph handle {}", handle.0),
+            Self::DuplicateTarget(target) => write!(f, "duplicate build graph target {target}"),
+            Self::Cycle { handle } => write!(f, "build graph cycle at handle {}", handle.0),
+        }
+    }
+}
+
+impl std::error::Error for GraphError {}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Graph {
+    nodes: Vec<GraphNode>,
+    artifact_producers: BTreeMap<Vec<u8>, Handle>,
+    targets: BTreeMap<Symbol, Handle>,
+}
+
+impl Graph {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn input(&mut self, path: impl Into<Vec<u8>>) -> Handle {
+        let artifact = Artifact::new(path);
+        let handle = self.push_node(GraphNode::Input {
+            artifact: artifact.clone(),
+        });
+        self.artifact_producers
+            .insert(artifact.path().to_vec(), handle);
+        handle
+    }
+
+    pub fn action(&mut self, action: Action) -> Handle {
+        let dependencies = self.dependencies_for_action(&action);
+        let outputs = action
+            .outputs()
+            .iter()
+            .map(|artifact| artifact.path().to_vec())
+            .collect::<Vec<_>>();
+        let handle = self.push_node(GraphNode::Action {
+            action,
+            dependencies,
+        });
+        for output in outputs {
+            self.artifact_producers.insert(output, handle);
+        }
+        handle
+    }
+
+    pub fn target(&mut self, name: impl Into<Symbol>, handle: Handle) -> Result<(), GraphError> {
+        self.require_handle(handle)?;
+        let name = name.into();
+        if self.targets.contains_key(&name) {
+            return Err(GraphError::DuplicateTarget(name));
+        }
+        self.targets.insert(name, handle);
+        Ok(())
+    }
+
+    pub fn node(&self, handle: Handle) -> Option<&GraphNode> {
+        self.nodes.get(handle.0)
+    }
+
+    pub fn len(&self) -> usize {
+        self.nodes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.nodes.is_empty()
+    }
+
+    pub fn dependencies_of(&self, handle: Handle) -> Result<Vec<Handle>, GraphError> {
+        self.require_handle(handle)?;
+        let mut visited = BTreeSet::new();
+        let mut dependencies = Vec::new();
+        self.collect_dependencies(handle, &mut visited, &mut dependencies)?;
+        Ok(dependencies)
+    }
+
+    pub fn reverse_dependencies_of(&self, handle: Handle) -> Result<Vec<Handle>, GraphError> {
+        self.require_handle(handle)?;
+        let mut visited = BTreeSet::new();
+        let mut reverse = Vec::new();
+        self.collect_reverse_dependencies(handle, &mut visited, &mut reverse)?;
+        Ok(reverse)
+    }
+
+    pub fn topological_order(&self) -> Result<Vec<Handle>, GraphError> {
+        let mut temporary = BTreeSet::new();
+        let mut permanent = BTreeSet::new();
+        let mut order = Vec::new();
+        for index in 0..self.nodes.len() {
+            self.visit_topological(Handle(index), &mut temporary, &mut permanent, &mut order)?;
+        }
+        Ok(order)
+    }
+
+    pub fn to_term(&self) -> Result<Term, GraphError> {
+        for handle in self.targets.values() {
+            self.require_acyclic(*handle)?;
+        }
+
+        if self.targets.is_empty() {
+            return Ok(Term::Record(BTreeMap::new()));
+        }
+
+        Ok(Term::Record(
+            self.targets
+                .iter()
+                .map(|(name, handle)| (name.clone(), self.term_for_handle(*handle)))
+                .collect(),
+        ))
+    }
+
+    pub fn render_dot(&self) -> String {
+        let mut dot = String::from("digraph build {\n  rankdir=LR;\n");
+        for (index, node) in self.nodes.iter().enumerate() {
+            dot.push_str(&format!(
+                "  n{index} [label=\"{}\"];\n",
+                escape_dot_label(&node_label(node, index))
+            ));
+        }
+        for (index, node) in self.nodes.iter().enumerate() {
+            if let GraphNode::Action { dependencies, .. } = node {
+                for dependency in dependencies {
+                    dot.push_str(&format!("  n{} -> n{index};\n", dependency.0));
+                }
+            }
+        }
+        for (name, handle) in &self.targets {
+            let target_id = format!("target_{}", sanitize_dot_id(name.as_str()));
+            dot.push_str(&format!(
+                "  {target_id} [shape=box,label=\"target:{}\"];\n",
+                escape_dot_label(name.as_str())
+            ));
+            dot.push_str(&format!("  n{} -> {target_id};\n", handle.0));
+        }
+        dot.push_str("}\n");
+        dot
+    }
+
+    fn push_node(&mut self, node: GraphNode) -> Handle {
+        let handle = Handle(self.nodes.len());
+        self.nodes.push(node);
+        handle
+    }
+
+    fn dependencies_for_action(&self, action: &Action) -> Vec<Handle> {
+        let mut seen = BTreeSet::new();
+        let mut dependencies = Vec::new();
+        for input in action.inputs() {
+            if let Some(handle) = self.artifact_producers.get(input.path())
+                && seen.insert(*handle)
+            {
+                dependencies.push(*handle);
+            }
+        }
+        dependencies
+    }
+
+    fn direct_dependencies(&self, handle: Handle) -> Result<&[Handle], GraphError> {
+        match self.node(handle).ok_or(GraphError::UnknownHandle(handle))? {
+            GraphNode::Input { .. } => Ok(&[]),
+            GraphNode::Action { dependencies, .. } => Ok(dependencies),
+        }
+    }
+
+    fn collect_dependencies(
+        &self,
+        handle: Handle,
+        visited: &mut BTreeSet<Handle>,
+        dependencies: &mut Vec<Handle>,
+    ) -> Result<(), GraphError> {
+        for dependency in self.direct_dependencies(handle)? {
+            if visited.insert(*dependency) {
+                self.collect_dependencies(*dependency, visited, dependencies)?;
+                dependencies.push(*dependency);
+            }
+        }
+        Ok(())
+    }
+
+    fn collect_reverse_dependencies(
+        &self,
+        handle: Handle,
+        visited: &mut BTreeSet<Handle>,
+        reverse: &mut Vec<Handle>,
+    ) -> Result<(), GraphError> {
+        for (index, node) in self.nodes.iter().enumerate() {
+            let candidate = Handle(index);
+            let GraphNode::Action { dependencies, .. } = node else {
+                continue;
+            };
+            if dependencies.contains(&handle) && visited.insert(candidate) {
+                reverse.push(candidate);
+                self.collect_reverse_dependencies(candidate, visited, reverse)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn visit_topological(
+        &self,
+        handle: Handle,
+        temporary: &mut BTreeSet<Handle>,
+        permanent: &mut BTreeSet<Handle>,
+        order: &mut Vec<Handle>,
+    ) -> Result<(), GraphError> {
+        self.require_handle(handle)?;
+        if permanent.contains(&handle) {
+            return Ok(());
+        }
+        if !temporary.insert(handle) {
+            return Err(GraphError::Cycle { handle });
+        }
+        for dependency in self.direct_dependencies(handle)? {
+            self.visit_topological(*dependency, temporary, permanent, order)?;
+        }
+        temporary.remove(&handle);
+        permanent.insert(handle);
+        order.push(handle);
+        Ok(())
+    }
+
+    fn require_handle(&self, handle: Handle) -> Result<(), GraphError> {
+        if handle.0 < self.nodes.len() {
+            Ok(())
+        } else {
+            Err(GraphError::UnknownHandle(handle))
+        }
+    }
+
+    fn require_acyclic(&self, handle: Handle) -> Result<(), GraphError> {
+        let mut temporary = BTreeSet::new();
+        let mut permanent = BTreeSet::new();
+        let mut order = Vec::new();
+        self.visit_topological(handle, &mut temporary, &mut permanent, &mut order)
+    }
+
+    fn term_for_handle(&self, handle: Handle) -> Term {
+        match &self.nodes[handle.0] {
+            GraphNode::Input { artifact } => Term::Value(Value::Bytes(artifact.path().to_vec())),
+            GraphNode::Action {
+                action,
+                dependencies,
+            } => thunk::force(thunk::delay(sequence_terms(
+                dependencies
+                    .iter()
+                    .map(|dependency| self.term_for_handle(*dependency))
+                    .collect(),
+                action.clone().into_term(),
+            ))),
+        }
     }
 }
 
@@ -289,6 +574,59 @@ fn zip_outputs(
     }
 
     Ok(outputs)
+}
+
+fn sequence_terms(prerequisites: Vec<Term>, body: Term) -> Term {
+    prerequisites
+        .into_iter()
+        .rev()
+        .fold(body, |body, prerequisite| Term::Apply {
+            callee: Box::new(Term::lambda(1, body)),
+            args: vec![prerequisite],
+        })
+}
+
+fn node_label(node: &GraphNode, index: usize) -> String {
+    match node {
+        GraphNode::Input { artifact } => {
+            format!(
+                "input#{index}\\n{}",
+                String::from_utf8_lossy(artifact.path())
+            )
+        }
+        GraphNode::Action { action, .. } => {
+            let outputs = action
+                .outputs()
+                .iter()
+                .map(|artifact| String::from_utf8_lossy(artifact.path()).into_owned())
+                .collect::<Vec<_>>()
+                .join(", ");
+            if outputs.is_empty() {
+                format!("action#{index}")
+            } else {
+                format!("action#{index}\\n{outputs}")
+            }
+        }
+    }
+}
+
+fn escape_dot_label(label: &str) -> String {
+    label.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn sanitize_dot_id(value: &str) -> String {
+    let mut output = String::new();
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            output.push(ch);
+        } else {
+            output.push('_');
+        }
+    }
+    if output.is_empty() {
+        output.push_str("unnamed");
+    }
+    output
 }
 
 #[cfg(test)]

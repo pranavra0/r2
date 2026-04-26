@@ -62,8 +62,9 @@ and `store gc`.
   records everywhere.
 
 `src/build.rs`
-: Build-oriented typed API over `process.spawn`. This currently models one
-  action; graph authoring is planned next.
+: Build-oriented typed API over `process.spawn`. `Action` models one process
+  step, while `Graph` adds DAG authoring, target naming, dependency
+  introspection, DOT rendering, and lowering to ordinary thunked r2 `Term`s.
 
 `src/service.rs`
 : Service-oriented typed API and restart-policy logic. The actual supervisor
