@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use r2::{Host, Runtime, RuntimeTraceEvent, RuntimeValue, Symbol, Term, Value};
@@ -113,6 +114,59 @@ fn cli_can_run_service_supervise_program() {
 
     let _ = std::fs::remove_file(program_path);
     let _ = std::fs::remove_file(marker_path);
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_sigint_cancels_supervised_service_without_orphaning_child() {
+    let program_path = unique_temp_path("r2-cli-service-cancel-program", "r2");
+    let pid_path = unique_temp_path("r2-cli-service-cancel-pid", "txt");
+    let script = r#"printf '%s' "$$" > "$1"; sleep 30"#;
+    let program = format!(
+        "perform service.supervise({{ argv: [{}, {}, {}, {}, {}], env_mode: {}, env: {{}}, stdin: {}, declared_inputs: [], declared_outputs: [{}], restart_policy: {{ mode: {}, delay_nanos: 0 }} }})",
+        string_literal("/bin/sh"),
+        string_literal("-c"),
+        string_literal(script),
+        string_literal("sh"),
+        string_literal(pid_path.to_string_lossy().as_ref()),
+        string_literal("clear"),
+        string_literal(""),
+        string_literal(pid_path.to_string_lossy().as_ref()),
+        string_literal("never"),
+    );
+    std::fs::write(&program_path, program).expect("program should write");
+
+    let child = Command::new(env!("CARGO_BIN_EXE_r2"))
+        .arg("run")
+        .arg("--memory-store")
+        .arg(&program_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("cli should start");
+
+    wait_for_path(&pid_path);
+    let supervised_pid = std::fs::read_to_string(&pid_path)
+        .expect("pid should read")
+        .parse::<libc::pid_t>()
+        .expect("pid should parse");
+
+    unsafe {
+        libc::kill(child.id() as libc::pid_t, libc::SIGINT);
+    }
+
+    let output = child.wait_with_output().expect("cli should exit");
+
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("cancelled"));
+    wait_until_not_running(supervised_pid);
+    assert!(
+        !process_is_running(supervised_pid),
+        "supervised child should not survive cancellation"
+    );
+
+    let _ = std::fs::remove_file(program_path);
+    let _ = std::fs::remove_file(pid_path);
 }
 
 #[cfg(unix)]
@@ -230,6 +284,34 @@ fn unique_temp_path(prefix: &str, extension: &str) -> PathBuf {
         "{prefix}-{}-{nanos}.{extension}",
         std::process::id()
     ))
+}
+
+#[cfg(unix)]
+fn wait_for_path(path: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if path.exists() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("timed out waiting for {}", path.display());
+}
+
+#[cfg(unix)]
+fn wait_until_not_running(pid: libc::pid_t) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if !process_is_running(pid) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(unix)]
+fn process_is_running(pid: libc::pid_t) -> bool {
+    unsafe { libc::kill(pid, 0) == 0 }
 }
 
 #[cfg(unix)]

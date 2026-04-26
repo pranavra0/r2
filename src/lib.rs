@@ -24,8 +24,8 @@ pub use host::{
     HostTraceEvent,
 };
 pub use runtime::{
-    Runtime, RuntimeError, RuntimeStoredKind, RuntimeTrace, RuntimeTraceEvent, RuntimeTraceSummary,
-    RuntimeValueKind, TracedRun,
+    CancellationToken, Runtime, RuntimeError, RuntimeStoredKind, RuntimeTrace, RuntimeTraceEvent,
+    RuntimeTraceSummary, RuntimeValueKind, TracedRun,
 };
 pub use service::{
     RestartDecision, RestartDelay, RestartMode, RestartPolicy, Service, ServiceSpec,

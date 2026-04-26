@@ -10,7 +10,10 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::effects::process;
-use crate::{Canonical, Continuation, Digest, EvalError, EvalResult, RuntimeValue, Symbol, Value};
+use crate::{
+    CancellationToken, Canonical, Continuation, Digest, EvalError, EvalResult, RuntimeValue,
+    Symbol, Value,
+};
 
 type Handler = dyn FnMut(Vec<RuntimeValue>, Continuation) -> Result<EvalResult, HostError>;
 type ProcessCache = Rc<RefCell<BTreeMap<Digest, Value>>>;
@@ -206,6 +209,7 @@ enum ServiceRestartDecision {
 pub struct Host {
     handlers: BTreeMap<Symbol, RegisteredHandler>,
     trace_events: HostTraceEvents,
+    cancellation: CancellationToken,
 }
 
 impl Host {
@@ -213,6 +217,15 @@ impl Host {
         Self {
             handlers: BTreeMap::new(),
             trace_events: Rc::new(RefCell::new(Vec::new())),
+            cancellation: CancellationToken::new(),
+        }
+    }
+
+    pub fn with_cancellation(cancellation: CancellationToken) -> Self {
+        Self {
+            handlers: BTreeMap::new(),
+            trace_events: Rc::new(RefCell::new(Vec::new())),
+            cancellation,
         }
     }
 
@@ -275,15 +288,17 @@ impl Host {
 
     pub fn install_hermetic_process_spawn(&mut self) {
         let cache = Rc::new(RefCell::new(BTreeMap::new()));
+        let cancellation = self.cancellation.clone();
         self.register_hermetic(PROCESS_SPAWN_OP, move |args, continuation| {
-            hermetic_process_spawn_handler(args, continuation, Rc::clone(&cache))
+            hermetic_process_spawn_handler(args, continuation, Rc::clone(&cache), &cancellation)
         });
     }
 
     pub fn install_service_supervise(&mut self) {
         let trace_events = Rc::clone(&self.trace_events);
+        let cancellation = self.cancellation.clone();
         self.register(SERVICE_SUPERVISE_OP, move |args, continuation| {
-            service_supervise_handler(args, continuation, Rc::clone(&trace_events))
+            service_supervise_handler(args, continuation, Rc::clone(&trace_events), &cancellation)
         });
     }
 
@@ -297,7 +312,10 @@ impl Host {
     }
 
     pub fn install_clock_sleep(&mut self) {
-        self.register(CLOCK_SLEEP_OP, clock_sleep_handler);
+        let cancellation = self.cancellation.clone();
+        self.register(CLOCK_SLEEP_OP, move |args, continuation| {
+            clock_sleep_handler(args, continuation, &cancellation)
+        });
     }
 
     pub fn install_math(&mut self) {
@@ -529,10 +547,11 @@ fn hermetic_process_spawn_handler(
     args: Vec<RuntimeValue>,
     continuation: Continuation,
     cache: ProcessCache,
+    cancellation: &CancellationToken,
 ) -> Result<EvalResult, HostError> {
     let value = match args.as_slice() {
         [RuntimeValue::Data(Value::Record(request))] => {
-            match run_hermetic_process_request(request, cache) {
+            match run_hermetic_process_request(request, cache, cancellation) {
                 Ok(value) => value,
                 Err(message) => error_value(message),
             }
@@ -547,10 +566,11 @@ fn service_supervise_handler(
     args: Vec<RuntimeValue>,
     continuation: Continuation,
     trace_events: HostTraceEvents,
+    cancellation: &CancellationToken,
 ) -> Result<EvalResult, HostError> {
     let value = match args.as_slice() {
         [RuntimeValue::Data(Value::Record(request))] => {
-            match run_service_supervise(request, trace_events) {
+            match run_service_supervise(request, trace_events, cancellation) {
                 Ok(value) => RuntimeValue::Data(value),
                 Err(message) => error_value(message),
             }
@@ -587,18 +607,17 @@ fn clock_now_handler(
 fn clock_sleep_handler(
     args: Vec<RuntimeValue>,
     continuation: Continuation,
+    cancellation: &CancellationToken,
 ) -> Result<EvalResult, HostError> {
     let value = match args.as_slice() {
         [RuntimeValue::Data(Value::Record(request))] => match parse_sleep_request(request) {
-            Ok(duration_nanos) => {
-                thread::sleep(Duration::from_nanos(
-                    u64::try_from(duration_nanos).expect("validated duration should fit u64"),
-                ));
-                RuntimeValue::Data(ok_record_value([(
+            Ok(duration_nanos) => match sleep_with_cancellation(duration_nanos, cancellation) {
+                Ok(()) => RuntimeValue::Data(ok_record_value([(
                     "duration_nanos",
                     Value::Integer(duration_nanos),
-                )]))
-            }
+                )])),
+                Err(message) => error_value(message),
+            },
             Err(message) => error_value(message),
         },
         _ => error_value("clock.sleep expected one record request argument"),
@@ -650,14 +669,16 @@ fn parse_math_integer_args(args: &[RuntimeValue], op: &str) -> Result<(i64, i64)
 fn run_process_request(request: &BTreeMap<Symbol, Value>) -> Result<RuntimeValue, String> {
     let request = parse_process_request(request)?;
     validate_declared_inputs(&request)?;
-    let output = execute_process(&request)?;
+    let output = execute_process(&request, &CancellationToken::new())?;
     Ok(RuntimeValue::Data(process_result_value(request, output)))
 }
 
 fn run_hermetic_process_request(
     request: &BTreeMap<Symbol, Value>,
     cache: ProcessCache,
+    cancellation: &CancellationToken,
 ) -> Result<RuntimeValue, String> {
+    check_cancelled(cancellation)?;
     let request = parse_process_request(request)?;
     validate_declared_inputs(&request)?;
     let cache_key = process_cache_key(&request)?;
@@ -668,7 +689,7 @@ fn run_hermetic_process_request(
     }
 
     enforce_process_sandbox(&request)?;
-    let output = execute_process(&request)?;
+    let output = execute_process(&request, cancellation)?;
     let value = process_result_value(request, output);
     if declared_outputs_complete(&value) {
         cache.borrow_mut().insert(cache_key, value.clone());
@@ -680,12 +701,14 @@ fn run_hermetic_process_request(
 fn run_service_supervise(
     request: &BTreeMap<Symbol, Value>,
     trace_events: HostTraceEvents,
+    cancellation: &CancellationToken,
 ) -> Result<Value, String> {
     let (spawn_request, restart_policy) = parse_service_spec(request)?;
     let mut spawn_count = 0_u32;
     let mut restart_count = 0_u32;
 
     loop {
+        check_cancelled(cancellation)?;
         spawn_count = spawn_count
             .checked_add(1)
             .ok_or_else(|| "service.supervise spawn count overflowed u32".to_string())?;
@@ -697,7 +720,7 @@ fn run_service_supervise(
 
         validate_declared_inputs(&spawn_request)?;
         enforce_process_sandbox(&spawn_request)?;
-        let output = execute_process(&spawn_request)?;
+        let output = execute_process(&spawn_request, cancellation)?;
         let status = process_status_from_exit_status(output.status);
         let status_value = process_status_value(&status);
         trace_events.borrow_mut().push(HostTraceEvent::ServiceExit {
@@ -718,10 +741,7 @@ fn run_service_supervise(
                     .checked_add(1)
                     .ok_or_else(|| "service.supervise restart count overflowed u32".to_string())?;
                 if delay_nanos > 0 {
-                    thread::sleep(Duration::from_nanos(
-                        u64::try_from(delay_nanos)
-                            .map_err(|_| "service.supervise delay overflowed u64".to_string())?,
-                    ));
+                    sleep_with_cancellation(delay_nanos, cancellation)?;
                 }
                 trace_events
                     .borrow_mut()
@@ -875,7 +895,11 @@ fn parse_sleep_request(request: &BTreeMap<Symbol, Value>) -> Result<i64, String>
     Ok(duration_nanos)
 }
 
-fn execute_process(request: &ProcessSpawnRequest) -> Result<std::process::Output, String> {
+fn execute_process(
+    request: &ProcessSpawnRequest,
+    cancellation: &CancellationToken,
+) -> Result<std::process::Output, String> {
+    check_cancelled(cancellation)?;
     let mut argv = request.argv.iter();
     let executable = argv
         .next()
@@ -912,9 +936,56 @@ fn execute_process(request: &ProcessSpawnRequest) -> Result<std::process::Output
             .map_err(|error| format!("process.spawn failed to write stdin: {error}"))?;
     }
 
-    child
-        .wait_with_output()
-        .map_err(|error| format!("process.spawn failed to wait for child: {error}"))
+    loop {
+        check_cancelled_child(cancellation, &mut child)?;
+        match child
+            .try_wait()
+            .map_err(|error| format!("process.spawn failed to wait for child: {error}"))?
+        {
+            Some(_) => {
+                return child.wait_with_output().map_err(|error| {
+                    format!("process.spawn failed to collect child output: {error}")
+                });
+            }
+            None => thread::sleep(Duration::from_millis(10)),
+        }
+    }
+}
+
+fn check_cancelled(cancellation: &CancellationToken) -> Result<(), String> {
+    if cancellation.is_cancelled() {
+        Err("cancelled".to_string())
+    } else {
+        Ok(())
+    }
+}
+
+fn check_cancelled_child(
+    cancellation: &CancellationToken,
+    child: &mut std::process::Child,
+) -> Result<(), String> {
+    if !cancellation.is_cancelled() {
+        return Ok(());
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    Err("cancelled".to_string())
+}
+
+fn sleep_with_cancellation(
+    delay_nanos: i64,
+    cancellation: &CancellationToken,
+) -> Result<(), String> {
+    let total = u64::try_from(delay_nanos)
+        .map_err(|_| "service.supervise delay overflowed u64".to_string())?;
+    let mut remaining = Duration::from_nanos(total);
+    while remaining > Duration::ZERO {
+        check_cancelled(cancellation)?;
+        let step = remaining.min(Duration::from_millis(10));
+        thread::sleep(step);
+        remaining = remaining.saturating_sub(step);
+    }
+    Ok(())
 }
 
 fn process_result_value(request: ProcessSpawnRequest, output: std::process::Output) -> Value {

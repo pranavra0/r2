@@ -3,11 +3,14 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::str::FromStr;
+use std::sync::OnceLock;
 
 use r2::{
-    Digest, FileStore, Host, ObjectStore, Ref, Reified, Runtime, RuntimeTrace, RuntimeTraceSummary,
-    RuntimeValue, TracedRun, Value, parse_program,
+    CancellationToken, Digest, FileStore, Host, ObjectStore, Ref, Reified, Runtime, RuntimeTrace,
+    RuntimeTraceSummary, RuntimeValue, TracedRun, Value, parse_program,
 };
+
+static CURRENT_CANCELLATION: OnceLock<CancellationToken> = OnceLock::new();
 
 fn main() -> ExitCode {
     match run() {
@@ -125,7 +128,9 @@ fn run_term<S: ObjectStore>(
     runtime: &mut Runtime<S>,
     parsed: &ParsedRunArgs,
 ) -> Result<(), String> {
-    let mut host = Host::new();
+    let cancellation = CancellationToken::new();
+    install_sigint_handler(cancellation.clone());
+    let mut host = Host::with_cancellation(cancellation.clone());
     host.install_fs_read();
     host.install_fs_write();
     host.install_clock();
@@ -135,18 +140,42 @@ fn run_term<S: ObjectStore>(
 
     if parsed.trace_requested {
         let traced = runtime
-            .run_with_trace(term, &mut host)
+            .run_with_trace_and_cancellation(term, &mut host, &cancellation)
             .map_err(|error| format!("runtime error: {error}"))?;
         print_traced_run(&traced, parsed.summary_requested);
     } else {
         let value = runtime
-            .run(term, &mut host)
+            .run_with_cancellation(term, &mut host, &cancellation)
             .map_err(|error| format!("runtime error: {error}"))?;
         println!("{}", format_runtime_value(&value));
     }
 
     Ok(())
 }
+
+fn install_sigint_handler(cancellation: CancellationToken) {
+    let _ = CURRENT_CANCELLATION.set(cancellation);
+    install_platform_sigint_handler();
+}
+
+#[cfg(unix)]
+fn install_platform_sigint_handler() {
+    unsafe extern "C" fn handle_sigint(_: libc::c_int) {
+        if let Some(token) = CURRENT_CANCELLATION.get() {
+            token.cancel();
+        }
+    }
+
+    unsafe {
+        libc::signal(
+            libc::SIGINT,
+            handle_sigint as *const () as libc::sighandler_t,
+        );
+    }
+}
+
+#[cfg(not(unix))]
+fn install_platform_sigint_handler() {}
 
 struct ParsedRunArgs {
     path: String,

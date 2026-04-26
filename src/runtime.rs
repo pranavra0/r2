@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::Canonical;
 use crate::data::{Digest, Ref, Symbol, Term, Value};
@@ -20,6 +22,7 @@ pub enum RuntimeError {
     Host(HostError),
     Thunk(ThunkError),
     UnhandledEffect { op: Symbol },
+    Cancelled,
 }
 
 impl fmt::Display for RuntimeError {
@@ -30,6 +33,7 @@ impl fmt::Display for RuntimeError {
             Self::Host(error) => error.fmt(f),
             Self::Thunk(error) => error.fmt(f),
             Self::UnhandledEffect { op } => write!(f, "unhandled effect {op}"),
+            Self::Cancelled => f.write_str("cancelled"),
         }
     }
 }
@@ -57,6 +61,33 @@ impl From<HostError> for RuntimeError {
 impl From<ThunkError> for RuntimeError {
     fn from(value: ThunkError) -> Self {
         Self::Thunk(value)
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct CancellationToken {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl CancellationToken {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+
+    fn check(&self) -> Result<(), RuntimeError> {
+        if self.is_cancelled() {
+            Err(RuntimeError::Cancelled)
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -562,8 +593,20 @@ impl<S: ObjectStore> Runtime<S> {
         term: Term,
         host: &mut H,
     ) -> Result<RuntimeValue, RuntimeError> {
+        let token = CancellationToken::new();
+        self.run_with_cancellation(term, host, &token)
+    }
+
+    pub fn run_with_cancellation<H: HostHandler>(
+        &mut self,
+        term: Term,
+        host: &mut H,
+        cancellation: &CancellationToken,
+    ) -> Result<RuntimeValue, RuntimeError> {
         let mut trace = NullTrace;
-        Ok(self.run_with_trace_sink(term, host, &mut trace)?.value)
+        Ok(self
+            .run_with_trace_sink(term, host, &mut trace, cancellation)?
+            .value)
     }
 
     pub fn run_with_trace<H: HostHandler>(
@@ -571,8 +614,20 @@ impl<S: ObjectStore> Runtime<S> {
         term: Term,
         host: &mut H,
     ) -> Result<TracedRun, RuntimeError> {
+        let token = CancellationToken::new();
+        self.run_with_trace_and_cancellation(term, host, &token)
+    }
+
+    pub fn run_with_trace_and_cancellation<H: HostHandler>(
+        &mut self,
+        term: Term,
+        host: &mut H,
+        cancellation: &CancellationToken,
+    ) -> Result<TracedRun, RuntimeError> {
         let mut trace = RuntimeTrace::default();
-        let value = self.run_with_trace_sink(term, host, &mut trace)?.value;
+        let value = self
+            .run_with_trace_sink(term, host, &mut trace, cancellation)?
+            .value;
         Ok(TracedRun { value, trace })
     }
 
@@ -581,9 +636,19 @@ impl<S: ObjectStore> Runtime<S> {
         reference: &Ref,
         host: &mut H,
     ) -> Result<RuntimeValue, RuntimeError> {
+        let token = CancellationToken::new();
+        self.run_ref_with_cancellation(reference, host, &token)
+    }
+
+    pub fn run_ref_with_cancellation<H: HostHandler>(
+        &mut self,
+        reference: &Ref,
+        host: &mut H,
+        cancellation: &CancellationToken,
+    ) -> Result<RuntimeValue, RuntimeError> {
         let mut trace = NullTrace;
         Ok(self
-            .run_ref_with_trace_sink(reference, host, &mut trace)?
+            .run_ref_with_trace_sink(reference, host, &mut trace, cancellation)?
             .value)
     }
 
@@ -592,9 +657,19 @@ impl<S: ObjectStore> Runtime<S> {
         reference: &Ref,
         host: &mut H,
     ) -> Result<TracedRun, RuntimeError> {
+        let token = CancellationToken::new();
+        self.run_ref_with_trace_and_cancellation(reference, host, &token)
+    }
+
+    pub fn run_ref_with_trace_and_cancellation<H: HostHandler>(
+        &mut self,
+        reference: &Ref,
+        host: &mut H,
+        cancellation: &CancellationToken,
+    ) -> Result<TracedRun, RuntimeError> {
         let mut trace = RuntimeTrace::default();
         let value = self
-            .run_ref_with_trace_sink(reference, host, &mut trace)?
+            .run_ref_with_trace_sink(reference, host, &mut trace, cancellation)?
             .value;
         Ok(TracedRun { value, trace })
     }
@@ -649,9 +724,11 @@ impl<S: ObjectStore> Runtime<S> {
         term: Term,
         host: &mut H,
         trace: &mut T,
+        cancellation: &CancellationToken,
     ) -> Result<RunOutcome, RuntimeError> {
+        cancellation.check()?;
         let result = self.eval_with_trace_sink(term, trace)?;
-        self.drive_with_trace(result, host, trace)
+        self.drive_with_trace(result, host, trace, cancellation)
     }
 
     fn run_ref_with_trace_sink<H: HostHandler, T: TraceSink>(
@@ -659,9 +736,11 @@ impl<S: ObjectStore> Runtime<S> {
         reference: &Ref,
         host: &mut H,
         trace: &mut T,
+        cancellation: &CancellationToken,
     ) -> Result<RunOutcome, RuntimeError> {
+        cancellation.check()?;
         let result = self.eval_ref_with_trace_sink(reference, trace)?;
-        self.drive_with_trace(result, host, trace)
+        self.drive_with_trace(result, host, trace, cancellation)
     }
 
     fn drive_with_trace<H: HostHandler, T: TraceSink>(
@@ -669,12 +748,14 @@ impl<S: ObjectStore> Runtime<S> {
         mut result: EvalResult,
         host: &mut H,
         trace: &mut T,
+        cancellation: &CancellationToken,
     ) -> Result<RunOutcome, RuntimeError> {
         let mut cacheable = true;
         let mut uncacheable_effect = None;
         let mut uncacheable_policy = None;
 
         loop {
+            cancellation.check()?;
             match result {
                 EvalResult::Done(value) => {
                     trace.record(RuntimeTraceEvent::RunComplete {
@@ -692,7 +773,7 @@ impl<S: ObjectStore> Runtime<S> {
                         op: yielded.op.clone(),
                     });
                     if let Some(next) =
-                        self.handle_builtin_with_trace(yielded.clone(), host, trace)?
+                        self.handle_builtin_with_trace(yielded.clone(), host, trace, cancellation)?
                     {
                         trace.record(RuntimeTraceEvent::BuiltinHandle { op: yielded.op });
                         result = next;
@@ -731,11 +812,15 @@ impl<S: ObjectStore> Runtime<S> {
         yielded: Yielded,
         host: &mut H,
         trace: &mut T,
+        cancellation: &CancellationToken,
     ) -> Result<Option<EvalResult>, RuntimeError> {
         if yielded.op.as_str() == thunk::FORCE_OP {
-            return Ok(Some(
-                self.handle_thunk_force_with_trace(yielded, host, trace)?,
-            ));
+            return Ok(Some(self.handle_thunk_force_with_trace(
+                yielded,
+                host,
+                trace,
+                cancellation,
+            )?));
         }
 
         Ok(None)
@@ -746,8 +831,9 @@ impl<S: ObjectStore> Runtime<S> {
         yielded: Yielded,
         host: &mut H,
         trace: &mut T,
+        cancellation: &CancellationToken,
     ) -> Result<EvalResult, RuntimeError> {
-        let value = self.force_thunk_args_with_trace(yielded.args, host, trace)?;
+        let value = self.force_thunk_args_with_trace(yielded.args, host, trace, cancellation)?;
         yielded.continuation.resume(value).map_err(Into::into)
     }
 
@@ -756,6 +842,7 @@ impl<S: ObjectStore> Runtime<S> {
         args: Vec<RuntimeValue>,
         host: &mut H,
         trace: &mut T,
+        cancellation: &CancellationToken,
     ) -> Result<RuntimeValue, RuntimeError> {
         let mut args = args.into_iter();
         let thunk = args.next().ok_or(ThunkError::WrongArgumentCount {
@@ -771,7 +858,7 @@ impl<S: ObjectStore> Runtime<S> {
             .into());
         }
 
-        self.force_thunk_with_trace(thunk, host, trace)
+        self.force_thunk_with_trace(thunk, host, trace, cancellation)
     }
 
     fn force_thunk_with_trace<H: HostHandler, T: TraceSink>(
@@ -779,7 +866,9 @@ impl<S: ObjectStore> Runtime<S> {
         thunk_value: RuntimeValue,
         host: &mut H,
         trace: &mut T,
+        cancellation: &CancellationToken,
     ) -> Result<RuntimeValue, RuntimeError> {
+        cancellation.check()?;
         let (key, term) = reified_thunk_term(&thunk_value)?;
         trace.record(RuntimeTraceEvent::ThunkForce { key });
 
@@ -794,7 +883,7 @@ impl<S: ObjectStore> Runtime<S> {
             return Ok(reified.into_runtime());
         }
 
-        let outcome = self.run_with_trace_sink(term, host, trace)?;
+        let outcome = self.run_with_trace_sink(term, host, trace, cancellation)?;
 
         if !outcome.cacheable {
             trace.record(RuntimeTraceEvent::ThunkCacheBypass {
@@ -1310,5 +1399,32 @@ mod tests {
 
         assert_eq!(runtime.max_thunk_cache_entries(), 2);
         assert!(runtime.thunk_cache_len() <= 2);
+    }
+
+    #[test]
+    fn cancellation_stops_drive_loop_at_yield_boundary() {
+        let cancellation = CancellationToken::new();
+        let handler_token = cancellation.clone();
+        let mut host = Host::new();
+        host.register("cancel.now", move |_, continuation| {
+            handler_token.cancel();
+            continuation
+                .resume(RuntimeValue::Data(Value::Integer(0)))
+                .map_err(Into::into)
+        });
+        let mut runtime = Runtime::new();
+
+        let error = runtime
+            .run_with_cancellation(
+                Term::Perform {
+                    op: Symbol::from("cancel.now"),
+                    args: Vec::new(),
+                },
+                &mut host,
+                &cancellation,
+            )
+            .expect_err("cancelled run should fail");
+
+        assert!(matches!(error, RuntimeError::Cancelled));
     }
 }
