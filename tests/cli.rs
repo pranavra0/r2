@@ -255,7 +255,7 @@ fn trace_command_caches_hermetic_process_spawn_thunks() {
 
     let script = "cat \"$1\" > \"$2\"; printf 'run\\n' >> \"$3\"";
     let request = format!(
-        "{{ argv: [{}, {}, {}, {}, {}, {}, {}], env_mode: {}, env: {{}}, stdin: {}, declared_inputs: [{}], declared_outputs: [{}] }}",
+        "{{ argv: [{}, {}, {}, {}, {}, {}, {}], env_mode: {}, env: {{}}, stdin: {}, declared_inputs: [{}], declared_outputs: [{}, {}] }}",
         string_literal("/bin/sh"),
         string_literal("-c"),
         string_literal(script),
@@ -267,6 +267,7 @@ fn trace_command_caches_hermetic_process_spawn_thunks() {
         string_literal(""),
         string_literal(input_path.to_string_lossy().as_ref()),
         string_literal(output_path.to_string_lossy().as_ref()),
+        string_literal(marker_path.to_string_lossy().as_ref()),
     );
     std::fs::write(
         &program_path,

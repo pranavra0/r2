@@ -97,6 +97,67 @@ fn hermetic_process_spawn_does_not_cache_missing_declared_outputs() {
     let _ = std::fs::remove_file(marker_path);
 }
 
+#[cfg(all(unix, feature = "sandbox"))]
+#[test]
+fn sandbox_denies_undeclared_absolute_paths() {
+    let input_path = unique_temp_path("r2-process-sandbox-input", "txt");
+    let output_path = unique_temp_path("r2-process-sandbox-output", "txt");
+    let marker_path = unique_temp_path("r2-process-sandbox-marker", "txt");
+    std::fs::write(&input_path, "v1").expect("input should write");
+
+    let mut runtime = Runtime::new();
+    let mut host = Host::new();
+    host.install_hermetic_process_spawn();
+    let request = process_request_with_script(
+        &input_path,
+        &output_path,
+        &marker_path,
+        r#"cat /etc/passwd > "$2"; printf 'run\n' >> "$3""#,
+    );
+
+    let result = runtime.run(request, &mut host).expect("program should run");
+
+    match result {
+        RuntimeValue::Data(Value::Tagged { tag, fields }) => {
+            assert_eq!(tag, Symbol::from("error"));
+            assert!(
+                String::from_utf8_lossy(&extract_error_bytes(&fields))
+                    .contains("permission_denied")
+            );
+        }
+        other => panic!("unexpected result: {other:?}"),
+    }
+    assert!(!output_path.exists());
+    assert!(!marker_path.exists());
+
+    let _ = std::fs::remove_file(input_path);
+    let _ = std::fs::remove_file(output_path);
+    let _ = std::fs::remove_file(marker_path);
+}
+
+#[cfg(all(unix, feature = "sandbox"))]
+#[test]
+fn sandbox_allows_declared_input_and_output_paths() {
+    let input_path = unique_temp_path("r2-process-sandbox-allowed-input", "txt");
+    let output_path = unique_temp_path("r2-process-sandbox-allowed-output", "txt");
+    let marker_path = unique_temp_path("r2-process-sandbox-allowed-marker", "txt");
+    std::fs::write(&input_path, "allowed").expect("input should write");
+
+    let mut runtime = Runtime::new();
+    let mut host = Host::new();
+    host.install_hermetic_process_spawn();
+    let request = process_request(&input_path, &output_path, &marker_path);
+
+    let result = runtime.run(request, &mut host).expect("program should run");
+
+    assert_ok_result(result);
+    assert_eq!(std::fs::read_to_string(&output_path).unwrap(), "allowed");
+
+    let _ = std::fs::remove_file(input_path);
+    let _ = std::fs::remove_file(output_path);
+    let _ = std::fs::remove_file(marker_path);
+}
+
 #[cfg(unix)]
 fn process_request(input: &Path, output: &Path, marker: &Path) -> Term {
     process_request_with_script(
@@ -133,7 +194,10 @@ fn process_request_with_script(input: &Path, output: &Path, marker: &Path, scrip
             ),
             (
                 Symbol::from("declared_outputs"),
-                Value::List(vec![Value::Bytes(path_to_bytes(output))]),
+                Value::List(vec![
+                    Value::Bytes(path_to_bytes(output)),
+                    Value::Bytes(path_to_bytes(marker)),
+                ]),
             ),
         ])))],
     }
@@ -144,6 +208,14 @@ fn assert_ok_result(value: RuntimeValue) {
     match value {
         RuntimeValue::Data(Value::Tagged { tag, .. }) => assert_eq!(tag, Symbol::from("ok")),
         other => panic!("unexpected result: {other:?}"),
+    }
+}
+
+#[cfg(all(unix, feature = "sandbox"))]
+fn extract_error_bytes(fields: &[Value]) -> Vec<u8> {
+    match fields {
+        [Value::Bytes(bytes)] => bytes.clone(),
+        other => panic!("unexpected error fields: {other:?}"),
     }
 }
 

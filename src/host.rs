@@ -49,13 +49,23 @@ pub enum HostEffectProvenance {
 pub struct HostEffectPolicy {
     caching: HostEffectCaching,
     provenance: HostEffectProvenance,
+    sandbox: bool,
 }
 
 impl HostEffectPolicy {
     pub const fn new(caching: HostEffectCaching, provenance: HostEffectProvenance) -> Self {
+        Self::with_sandbox(caching, provenance, false)
+    }
+
+    pub const fn with_sandbox(
+        caching: HostEffectCaching,
+        provenance: HostEffectProvenance,
+        sandbox: bool,
+    ) -> Self {
         Self {
             caching,
             provenance,
+            sandbox,
         }
     }
 
@@ -72,7 +82,11 @@ impl HostEffectPolicy {
     }
 
     pub const fn hermetic() -> Self {
-        Self::new(HostEffectCaching::Allow, HostEffectProvenance::Declared)
+        Self::with_sandbox(
+            HostEffectCaching::Allow,
+            HostEffectProvenance::Declared,
+            true,
+        )
     }
 
     pub const fn caching(self) -> HostEffectCaching {
@@ -85,6 +99,10 @@ impl HostEffectPolicy {
 
     pub const fn allows_thunk_cache(self) -> bool {
         matches!(self.caching, HostEffectCaching::Allow)
+    }
+
+    pub const fn sandbox(self) -> bool {
+        self.sandbox
     }
 }
 
@@ -573,6 +591,7 @@ fn run_hermetic_process_request(
         return Ok(RuntimeValue::Data(value));
     }
 
+    enforce_process_sandbox(&request)?;
     let output = execute_process(&request)?;
     let value = process_result_value(request, output);
     if declared_outputs_complete(&value) {
@@ -580,6 +599,19 @@ fn run_hermetic_process_request(
     }
 
     Ok(RuntimeValue::Data(value))
+}
+
+fn enforce_process_sandbox(request: &ProcessSpawnRequest) -> Result<(), String> {
+    #[cfg(feature = "sandbox")]
+    {
+        enforce_declared_path_sandbox(request)
+    }
+
+    #[cfg(not(feature = "sandbox"))]
+    {
+        let _ = request;
+        Ok(())
+    }
 }
 
 fn parse_process_request(request: &BTreeMap<Symbol, Value>) -> Result<ProcessSpawnRequest, String> {
@@ -716,6 +748,91 @@ fn validate_declared_inputs(request: &ProcessSpawnRequest) -> Result<(), String>
     }
 
     Ok(())
+}
+
+#[cfg(feature = "sandbox")]
+fn enforce_declared_path_sandbox(request: &ProcessSpawnRequest) -> Result<(), String> {
+    let allowed_paths = request
+        .declared_inputs
+        .iter()
+        .chain(request.declared_outputs.iter())
+        .map(|path| path_from_bytes(path.clone()))
+        .collect::<Vec<_>>();
+
+    for argument in request.argv.iter().skip(1) {
+        for path in absolute_paths_in_argument(argument) {
+            if !is_declared_sandbox_path(&path, &allowed_paths) {
+                return Err(format!(
+                    "permission_denied: process.spawn sandbox denied access to undeclared path {}",
+                    path.display()
+                ));
+            }
+        }
+    }
+
+    if let Some(cwd) = &request.cwd {
+        let cwd = path_from_bytes(cwd.clone());
+        if cwd.is_absolute() && !is_declared_sandbox_path(&cwd, &allowed_paths) {
+            return Err(format!(
+                "permission_denied: process.spawn sandbox denied cwd {}",
+                cwd.display()
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "sandbox")]
+fn absolute_paths_in_argument(argument: &[u8]) -> Vec<PathBuf> {
+    let text = String::from_utf8_lossy(argument);
+    let bytes = text.as_bytes();
+    let mut paths = Vec::new();
+    let mut index = 0;
+
+    while index < bytes.len() {
+        if bytes[index] != b'/' {
+            index += 1;
+            continue;
+        }
+
+        let start = index;
+        while index < bytes.len() && !is_shell_path_boundary(bytes[index]) {
+            index += 1;
+        }
+        paths.push(PathBuf::from(&text[start..index]));
+    }
+
+    paths
+}
+
+#[cfg(feature = "sandbox")]
+fn is_shell_path_boundary(byte: u8) -> bool {
+    matches!(
+        byte,
+        b'\0'
+            | b' '
+            | b'\t'
+            | b'\n'
+            | b'\r'
+            | b'"'
+            | b'\''
+            | b'`'
+            | b';'
+            | b'|'
+            | b'&'
+            | b'<'
+            | b'>'
+            | b'('
+            | b')'
+    )
+}
+
+#[cfg(feature = "sandbox")]
+fn is_declared_sandbox_path(path: &std::path::Path, allowed_paths: &[PathBuf]) -> bool {
+    allowed_paths
+        .iter()
+        .any(|allowed| path == allowed || path.starts_with(allowed))
 }
 
 fn process_cache_key(request: &ProcessSpawnRequest) -> Result<Digest, String> {
