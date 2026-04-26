@@ -6,6 +6,7 @@ use crate::data::{Digest, Ref, Symbol, Term, Value};
 use crate::eval::{EvalError, EvalResult, Reified, RuntimeValue, Yielded, eval};
 use crate::host::{
     HostEffectCaching, HostEffectPolicy, HostEffectProvenance, HostError, HostHandler,
+    HostTraceEvent,
 };
 use crate::store::{CachedThunk, MemoryStore, ObjectStore, StoreError, Stored};
 use crate::thunk::{self, ThunkError};
@@ -128,6 +129,20 @@ pub enum RuntimeTraceEvent {
         op: Symbol,
         policy: HostEffectPolicy,
     },
+    ServiceSpawn {
+        iteration: u32,
+    },
+    ServiceExit {
+        iteration: u32,
+        status: Value,
+    },
+    ServiceRestart {
+        next_iteration: u32,
+    },
+    ServiceStop {
+        restart_count: u32,
+        final_status: Value,
+    },
     UnhandledEffect {
         op: Symbol,
     },
@@ -172,6 +187,20 @@ impl fmt::Display for RuntimeTraceEvent {
             Self::Yield { op } => write!(f, "yield: {op}"),
             Self::BuiltinHandle { op } => write!(f, "builtin handle: {op}"),
             Self::HostHandle { op, policy } => write!(f, "host handle: {op} [{policy}]"),
+            Self::ServiceSpawn { iteration } => write!(f, "service spawn: {iteration}"),
+            Self::ServiceExit { iteration, status } => {
+                write!(f, "service exit: {iteration} {status:?}")
+            }
+            Self::ServiceRestart { next_iteration } => {
+                write!(f, "service restart: {next_iteration}")
+            }
+            Self::ServiceStop {
+                restart_count,
+                final_status,
+            } => write!(
+                f,
+                "service stop: restarts {restart_count}, final status {final_status:?}"
+            ),
             Self::UnhandledEffect { op } => write!(f, "unhandled effect: {op}"),
             Self::ThunkForce { key } => write!(f, "thunk force: {key}"),
             Self::ThunkCacheHit { key } => write!(f, "thunk cache hit: {key}"),
@@ -250,6 +279,10 @@ impl RuntimeTrace {
                         }
                     }
                 }
+                RuntimeTraceEvent::ServiceSpawn { .. } => summary.service_spawns += 1,
+                RuntimeTraceEvent::ServiceExit { .. } => summary.service_exits += 1,
+                RuntimeTraceEvent::ServiceRestart { .. } => summary.service_restarts += 1,
+                RuntimeTraceEvent::ServiceStop { .. } => summary.service_stops += 1,
                 RuntimeTraceEvent::UnhandledEffect { .. } => summary.unhandled_effects += 1,
                 RuntimeTraceEvent::ThunkForce { .. } => summary.thunk_forces += 1,
                 RuntimeTraceEvent::ThunkCacheHit { .. } => summary.thunk_cache_hits += 1,
@@ -288,6 +321,10 @@ pub struct RuntimeTraceSummary {
     pub volatile_host_handles: usize,
     pub declared_host_handles: usize,
     pub hermetic_host_handles: usize,
+    pub service_spawns: usize,
+    pub service_exits: usize,
+    pub service_restarts: usize,
+    pub service_stops: usize,
     pub unhandled_effects: usize,
     pub thunk_forces: usize,
     pub thunk_cache_hits: usize,
@@ -596,6 +633,9 @@ impl<S: ObjectStore> Runtime<S> {
                             op: yielded.op,
                             policy,
                         });
+                        for event in host.drain_trace_events() {
+                            trace.record(event.into());
+                        }
                         result = next;
                     } else {
                         trace.record(RuntimeTraceEvent::UnhandledEffect {
@@ -744,6 +784,27 @@ impl<S: ObjectStore> Runtime<S> {
         self.store.put_cached_thunk(key, cached)?;
 
         Ok(())
+    }
+}
+
+impl From<HostTraceEvent> for RuntimeTraceEvent {
+    fn from(value: HostTraceEvent) -> Self {
+        match value {
+            HostTraceEvent::ServiceSpawn { iteration } => Self::ServiceSpawn { iteration },
+            HostTraceEvent::ServiceExit { iteration, status } => {
+                Self::ServiceExit { iteration, status }
+            }
+            HostTraceEvent::ServiceRestart { next_iteration } => {
+                Self::ServiceRestart { next_iteration }
+            }
+            HostTraceEvent::ServiceStop {
+                restart_count,
+                final_status,
+            } => Self::ServiceStop {
+                restart_count,
+                final_status,
+            },
+        }
     }
 }
 

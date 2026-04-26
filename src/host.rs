@@ -9,14 +9,17 @@ use std::rc::Rc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::effects::process;
 use crate::{Canonical, Continuation, Digest, EvalError, EvalResult, RuntimeValue, Symbol, Value};
 
 type Handler = dyn FnMut(Vec<RuntimeValue>, Continuation) -> Result<EvalResult, HostError>;
 type ProcessCache = Rc<RefCell<BTreeMap<Digest, Value>>>;
+type HostTraceEvents = Rc<RefCell<Vec<HostTraceEvent>>>;
 
 const FS_READ_OP: &str = "fs.read";
 const FS_WRITE_OP: &str = "fs.write";
 const PROCESS_SPAWN_OP: &str = "process.spawn";
+const SERVICE_SUPERVISE_OP: &str = "service.supervise";
 const CLOCK_NOW_OP: &str = "clock.now";
 const CLOCK_SLEEP_OP: &str = "clock.sleep";
 const MATH_ADD_OP: &str = "math.add";
@@ -134,11 +137,33 @@ pub trait HostHandler {
     fn effect_policy(&self, _op: &Symbol) -> HostEffectPolicy {
         HostEffectPolicy::volatile()
     }
+
+    fn drain_trace_events(&mut self) -> Vec<HostTraceEvent> {
+        Vec::new()
+    }
 }
 
 struct RegisteredHandler {
     handler: Box<Handler>,
     policy: HostEffectPolicy,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HostTraceEvent {
+    ServiceSpawn {
+        iteration: u32,
+    },
+    ServiceExit {
+        iteration: u32,
+        status: Value,
+    },
+    ServiceRestart {
+        next_iteration: u32,
+    },
+    ServiceStop {
+        restart_count: u32,
+        final_status: Value,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -158,14 +183,36 @@ enum EnvMode {
     Inherit,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ServiceRestartMode {
+    Never,
+    Always,
+    OnFailure,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ServiceRestartPolicy {
+    mode: ServiceRestartMode,
+    max_restarts: Option<u32>,
+    delay_nanos: i64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ServiceRestartDecision {
+    Stop,
+    Restart { delay_nanos: i64 },
+}
+
 pub struct Host {
     handlers: BTreeMap<Symbol, RegisteredHandler>,
+    trace_events: HostTraceEvents,
 }
 
 impl Host {
     pub fn new() -> Self {
         Self {
             handlers: BTreeMap::new(),
+            trace_events: Rc::new(RefCell::new(Vec::new())),
         }
     }
 
@@ -230,6 +277,13 @@ impl Host {
         let cache = Rc::new(RefCell::new(BTreeMap::new()));
         self.register_hermetic(PROCESS_SPAWN_OP, move |args, continuation| {
             hermetic_process_spawn_handler(args, continuation, Rc::clone(&cache))
+        });
+    }
+
+    pub fn install_service_supervise(&mut self) {
+        let trace_events = Rc::clone(&self.trace_events);
+        self.register(SERVICE_SUPERVISE_OP, move |args, continuation| {
+            service_supervise_handler(args, continuation, Rc::clone(&trace_events))
         });
     }
 
@@ -331,6 +385,10 @@ impl HostHandler for Host {
             .get(op)
             .map(|handler| handler.policy)
             .unwrap_or_else(HostEffectPolicy::volatile)
+    }
+
+    fn drain_trace_events(&mut self) -> Vec<HostTraceEvent> {
+        self.trace_events.borrow_mut().drain(..).collect()
     }
 }
 
@@ -485,6 +543,24 @@ fn hermetic_process_spawn_handler(
     continuation.resume(value).map_err(Into::into)
 }
 
+fn service_supervise_handler(
+    args: Vec<RuntimeValue>,
+    continuation: Continuation,
+    trace_events: HostTraceEvents,
+) -> Result<EvalResult, HostError> {
+    let value = match args.as_slice() {
+        [RuntimeValue::Data(Value::Record(request))] => {
+            match run_service_supervise(request, trace_events) {
+                Ok(value) => RuntimeValue::Data(value),
+                Err(message) => error_value(message),
+            }
+        }
+        _ => error_value("service.supervise expected one record service spec argument"),
+    };
+
+    continuation.resume(value).map_err(Into::into)
+}
+
 fn clock_now_handler(
     args: Vec<RuntimeValue>,
     continuation: Continuation,
@@ -601,6 +677,62 @@ fn run_hermetic_process_request(
     Ok(RuntimeValue::Data(value))
 }
 
+fn run_service_supervise(
+    request: &BTreeMap<Symbol, Value>,
+    trace_events: HostTraceEvents,
+) -> Result<Value, String> {
+    let (spawn_request, restart_policy) = parse_service_spec(request)?;
+    let mut spawn_count = 0_u32;
+    let mut restart_count = 0_u32;
+
+    loop {
+        spawn_count = spawn_count
+            .checked_add(1)
+            .ok_or_else(|| "service.supervise spawn count overflowed u32".to_string())?;
+        trace_events
+            .borrow_mut()
+            .push(HostTraceEvent::ServiceSpawn {
+                iteration: spawn_count,
+            });
+
+        validate_declared_inputs(&spawn_request)?;
+        enforce_process_sandbox(&spawn_request)?;
+        let output = execute_process(&spawn_request)?;
+        let status = process_status_from_exit_status(output.status);
+        let status_value = process_status_value(&status);
+        trace_events.borrow_mut().push(HostTraceEvent::ServiceExit {
+            iteration: spawn_count,
+            status: status_value.clone(),
+        });
+
+        match service_restart_decision(restart_policy, &status, spawn_count)? {
+            ServiceRestartDecision::Stop => {
+                trace_events.borrow_mut().push(HostTraceEvent::ServiceStop {
+                    restart_count,
+                    final_status: status_value.clone(),
+                });
+                return Ok(service_supervise_result_value(status_value, restart_count));
+            }
+            ServiceRestartDecision::Restart { delay_nanos } => {
+                restart_count = restart_count
+                    .checked_add(1)
+                    .ok_or_else(|| "service.supervise restart count overflowed u32".to_string())?;
+                if delay_nanos > 0 {
+                    thread::sleep(Duration::from_nanos(
+                        u64::try_from(delay_nanos)
+                            .map_err(|_| "service.supervise delay overflowed u64".to_string())?,
+                    ));
+                }
+                trace_events
+                    .borrow_mut()
+                    .push(HostTraceEvent::ServiceRestart {
+                        next_iteration: spawn_count + 1,
+                    });
+            }
+        }
+    }
+}
+
 fn enforce_process_sandbox(request: &ProcessSpawnRequest) -> Result<(), String> {
     #[cfg(feature = "sandbox")]
     {
@@ -650,6 +782,77 @@ fn parse_process_request(request: &BTreeMap<Symbol, Value>) -> Result<ProcessSpa
         env_mode,
         declared_inputs,
         declared_outputs,
+    })
+}
+
+fn parse_service_spec(
+    request: &BTreeMap<Symbol, Value>,
+) -> Result<(ProcessSpawnRequest, ServiceRestartPolicy), String> {
+    let spawn_request = parse_process_request(request)?;
+    let restart_policy = match request.get(&Symbol::from("restart_policy")) {
+        Some(Value::Record(record)) => parse_service_restart_policy(record)?,
+        Some(_) => {
+            return Err("service.supervise field `restart_policy` must be a record".to_string());
+        }
+        None => ServiceRestartPolicy {
+            mode: ServiceRestartMode::Never,
+            max_restarts: None,
+            delay_nanos: 0,
+        },
+    };
+
+    Ok((spawn_request, restart_policy))
+}
+
+fn parse_service_restart_policy(
+    record: &BTreeMap<Symbol, Value>,
+) -> Result<ServiceRestartPolicy, String> {
+    let mode = match required_record_field(record, "mode", SERVICE_SUPERVISE_OP)? {
+        Value::Bytes(bytes) if bytes == b"never" => ServiceRestartMode::Never,
+        Value::Bytes(bytes) if bytes == b"always" => ServiceRestartMode::Always,
+        Value::Bytes(bytes) if bytes == b"on_failure" => ServiceRestartMode::OnFailure,
+        Value::Symbol(symbol) if symbol.as_str() == "never" => ServiceRestartMode::Never,
+        Value::Symbol(symbol) if symbol.as_str() == "always" => ServiceRestartMode::Always,
+        Value::Symbol(symbol) if symbol.as_str() == "on_failure" => ServiceRestartMode::OnFailure,
+        _ => {
+            return Err(
+                "service.supervise restart_policy.mode must be never, always, or on_failure"
+                    .to_string(),
+            );
+        }
+    };
+    let max_restarts = record
+        .get(&Symbol::from("max_restarts"))
+        .map(|value| {
+            let value = parse_integer(
+                value,
+                "service.supervise restart_policy.max_restarts must be an integer",
+            )?;
+            u32::try_from(value).map_err(|_| {
+                "service.supervise restart_policy.max_restarts must fit u32".to_string()
+            })
+        })
+        .transpose()?;
+    let delay_nanos = record
+        .get(&Symbol::from("delay_nanos"))
+        .map(|value| {
+            parse_integer(
+                value,
+                "service.supervise restart_policy.delay_nanos must be an integer",
+            )
+        })
+        .transpose()?
+        .unwrap_or(0);
+    if delay_nanos < 0 {
+        return Err(
+            "service.supervise restart_policy.delay_nanos must be non-negative".to_string(),
+        );
+    }
+
+    Ok(ServiceRestartPolicy {
+        mode,
+        max_restarts,
+        delay_nanos,
     })
 }
 
@@ -1000,30 +1203,75 @@ fn output_file_records(value: &Value) -> Result<&[Value], String> {
 }
 
 fn exit_status_value(status: ExitStatus) -> Value {
+    process_status_value(&process_status_from_exit_status(status))
+}
+
+fn process_status_from_exit_status(status: ExitStatus) -> process::ProcessStatus {
     match status.code() {
-        Some(code) => Value::Tagged {
-            tag: Symbol::from("exit_code"),
-            fields: vec![Value::Integer(i64::from(code))],
-        },
+        Some(code) => process::ProcessStatus::ExitCode(i64::from(code)),
         None => {
             #[cfg(unix)]
             {
                 use std::os::unix::process::ExitStatusExt;
 
                 if let Some(signal) = status.signal() {
-                    return Value::Tagged {
-                        tag: Symbol::from("signal"),
-                        fields: vec![Value::Integer(i64::from(signal))],
-                    };
+                    return process::ProcessStatus::Signal(i64::from(signal));
                 }
             }
 
-            Value::Tagged {
-                tag: Symbol::from("unknown_status"),
-                fields: Vec::new(),
-            }
+            process::ProcessStatus::Unknown
         }
     }
+}
+
+fn process_status_value(status: &process::ProcessStatus) -> Value {
+    match status {
+        process::ProcessStatus::ExitCode(code) => Value::Tagged {
+            tag: Symbol::from("exit_code"),
+            fields: vec![Value::Integer(*code)],
+        },
+        process::ProcessStatus::Signal(signal) => Value::Tagged {
+            tag: Symbol::from("signal"),
+            fields: vec![Value::Integer(*signal)],
+        },
+        process::ProcessStatus::Unknown => Value::Tagged {
+            tag: Symbol::from("unknown_status"),
+            fields: Vec::new(),
+        },
+    }
+}
+
+fn service_restart_decision(
+    policy: ServiceRestartPolicy,
+    status: &process::ProcessStatus,
+    spawn_count: u32,
+) -> Result<ServiceRestartDecision, String> {
+    let should_restart = match policy.mode {
+        ServiceRestartMode::Never => false,
+        ServiceRestartMode::Always => true,
+        ServiceRestartMode::OnFailure => !matches!(status, process::ProcessStatus::ExitCode(0)),
+    };
+
+    if !should_restart {
+        return Ok(ServiceRestartDecision::Stop);
+    }
+
+    if let Some(max_restarts) = policy.max_restarts
+        && spawn_count >= max_restarts
+    {
+        return Ok(ServiceRestartDecision::Stop);
+    }
+
+    Ok(ServiceRestartDecision::Restart {
+        delay_nanos: policy.delay_nanos,
+    })
+}
+
+fn service_supervise_result_value(final_status: Value, restart_count: u32) -> Value {
+    ok_record_value([
+        ("final_status", final_status),
+        ("restart_count", Value::Integer(i64::from(restart_count))),
+    ])
 }
 
 fn bytes_list_value(items: Vec<Vec<u8>>) -> Value {

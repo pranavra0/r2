@@ -21,6 +21,7 @@ pub use data::{
 pub use eval::{Continuation, EvalError, EvalResult, Reified, RuntimeValue, Yielded, eval};
 pub use host::{
     Host, HostEffectCaching, HostEffectPolicy, HostEffectProvenance, HostError, HostHandler,
+    HostTraceEvent,
 };
 pub use runtime::{
     Runtime, RuntimeError, RuntimeStoredKind, RuntimeTrace, RuntimeTraceEvent, RuntimeTraceSummary,

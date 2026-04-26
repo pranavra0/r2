@@ -66,6 +66,7 @@ fn run_term<S: ObjectStore>(
     host.install_clock();
     host.install_math();
     host.install_hermetic_process_spawn();
+    host.install_service_supervise();
 
     if parsed.trace_requested {
         let traced = runtime
@@ -209,6 +210,13 @@ fn print_trace_summary(summary: &RuntimeTraceSummary) {
         summary.volatile_host_handles,
         summary.declared_host_handles,
         summary.hermetic_host_handles
+    );
+    println!(
+        "- service: spawns {}, exits {}, restarts {}, stops {}",
+        summary.service_spawns,
+        summary.service_exits,
+        summary.service_restarts,
+        summary.service_stops
     );
     println!(
         "- thunk cache: hits {}, stores {}, bypasses {}",
