@@ -1,15 +1,18 @@
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::io::Write;
 use std::io::{self, ErrorKind};
 use std::path::PathBuf;
 use std::process::{Command, ExitStatus, Stdio};
+use std::rc::Rc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::{Continuation, EvalError, EvalResult, RuntimeValue, Symbol, Value};
+use crate::{Canonical, Continuation, Digest, EvalError, EvalResult, RuntimeValue, Symbol, Value};
 
 type Handler = dyn FnMut(Vec<RuntimeValue>, Continuation) -> Result<EvalResult, HostError>;
+type ProcessCache = Rc<RefCell<BTreeMap<Digest, Value>>>;
 
 const FS_READ_OP: &str = "fs.read";
 const FS_WRITE_OP: &str = "fs.write";
@@ -203,6 +206,13 @@ impl Host {
 
     pub fn install_process_spawn(&mut self) {
         self.register_declared(PROCESS_SPAWN_OP, process_spawn_handler);
+    }
+
+    pub fn install_hermetic_process_spawn(&mut self) {
+        let cache = Rc::new(RefCell::new(BTreeMap::new()));
+        self.register_hermetic(PROCESS_SPAWN_OP, move |args, continuation| {
+            hermetic_process_spawn_handler(args, continuation, Rc::clone(&cache))
+        });
     }
 
     pub fn install_clock(&mut self) {
@@ -439,6 +449,24 @@ fn process_spawn_handler(
     continuation.resume(value).map_err(Into::into)
 }
 
+fn hermetic_process_spawn_handler(
+    args: Vec<RuntimeValue>,
+    continuation: Continuation,
+    cache: ProcessCache,
+) -> Result<EvalResult, HostError> {
+    let value = match args.as_slice() {
+        [RuntimeValue::Data(Value::Record(request))] => {
+            match run_hermetic_process_request(request, cache) {
+                Ok(value) => value,
+                Err(message) => error_value(message),
+            }
+        }
+        _ => error_value("process.spawn expected one record request argument"),
+    };
+
+    continuation.resume(value).map_err(Into::into)
+}
+
 fn clock_now_handler(
     args: Vec<RuntimeValue>,
     continuation: Continuation,
@@ -530,6 +558,28 @@ fn run_process_request(request: &BTreeMap<Symbol, Value>) -> Result<RuntimeValue
     validate_declared_inputs(&request)?;
     let output = execute_process(&request)?;
     Ok(RuntimeValue::Data(process_result_value(request, output)))
+}
+
+fn run_hermetic_process_request(
+    request: &BTreeMap<Symbol, Value>,
+    cache: ProcessCache,
+) -> Result<RuntimeValue, String> {
+    let request = parse_process_request(request)?;
+    validate_declared_inputs(&request)?;
+    let cache_key = process_cache_key(&request)?;
+
+    if let Some(value) = cache.borrow().get(&cache_key).cloned() {
+        materialize_cached_outputs(&value)?;
+        return Ok(RuntimeValue::Data(value));
+    }
+
+    let output = execute_process(&request)?;
+    let value = process_result_value(request, output);
+    if declared_outputs_complete(&value) {
+        cache.borrow_mut().insert(cache_key, value.clone());
+    }
+
+    Ok(RuntimeValue::Data(value))
 }
 
 fn parse_process_request(request: &BTreeMap<Symbol, Value>) -> Result<ProcessSpawnRequest, String> {
@@ -666,6 +716,170 @@ fn validate_declared_inputs(request: &ProcessSpawnRequest) -> Result<(), String>
     }
 
     Ok(())
+}
+
+fn process_cache_key(request: &ProcessSpawnRequest) -> Result<Digest, String> {
+    let mut record = BTreeMap::new();
+    record.insert(Symbol::from("argv"), bytes_list_value(request.argv.clone()));
+    record.insert(Symbol::from("env"), env_cache_value(&request.env));
+    record.insert(
+        Symbol::from("cwd"),
+        optional_bytes_value(request.cwd.clone()),
+    );
+    record.insert(Symbol::from("stdin"), Value::Bytes(request.stdin.clone()));
+    record.insert(
+        Symbol::from("env_mode"),
+        Value::Bytes(env_mode_bytes(request.env_mode)),
+    );
+    record.insert(
+        Symbol::from("declared_inputs"),
+        declared_input_files_cache_value(&request.declared_inputs)?,
+    );
+    record.insert(
+        Symbol::from("declared_outputs"),
+        bytes_list_value(request.declared_outputs.clone()),
+    );
+
+    Ok(Value::Record(record).digest())
+}
+
+fn env_cache_value(env: &BTreeMap<Vec<u8>, Vec<u8>>) -> Value {
+    Value::List(
+        env.iter()
+            .map(|(key, value)| {
+                Value::Record(BTreeMap::from([
+                    (Symbol::from("key"), Value::Bytes(key.clone())),
+                    (Symbol::from("value"), Value::Bytes(value.clone())),
+                ]))
+            })
+            .collect(),
+    )
+}
+
+fn optional_bytes_value(value: Option<Vec<u8>>) -> Value {
+    match value {
+        Some(bytes) => Value::Tagged {
+            tag: Symbol::from("some"),
+            fields: vec![Value::Bytes(bytes)],
+        },
+        None => Value::Tagged {
+            tag: Symbol::from("none"),
+            fields: Vec::new(),
+        },
+    }
+}
+
+fn env_mode_bytes(mode: EnvMode) -> Vec<u8> {
+    match mode {
+        EnvMode::Clear => ENV_MODE_CLEAR.as_bytes().to_vec(),
+        EnvMode::Inherit => ENV_MODE_INHERIT.as_bytes().to_vec(),
+    }
+}
+
+fn declared_input_files_cache_value(paths: &[Vec<u8>]) -> Result<Value, String> {
+    paths
+        .iter()
+        .map(|path| {
+            let path_buf = path_from_bytes(path.clone());
+            let contents = std::fs::read(&path_buf).map_err(|error| {
+                format!(
+                    "process.spawn declared input {} was not readable: {error}",
+                    path_buf.display()
+                )
+            })?;
+            Ok(Value::Record(BTreeMap::from([
+                (Symbol::from("path"), Value::Bytes(path.clone())),
+                (Symbol::from("contents"), Value::Bytes(contents)),
+            ])))
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Value::List)
+}
+
+fn declared_outputs_complete(value: &Value) -> bool {
+    output_file_records(value)
+        .map(|files| {
+            files.iter().all(|file| match file {
+                Value::Record(file) => {
+                    matches!(
+                        file.get(&Symbol::from("contents")),
+                        Some(Value::Tagged { tag, fields })
+                            if *tag == Symbol::from("ok")
+                                && matches!(fields.as_slice(), [Value::Bytes(_)])
+                    )
+                }
+                _ => false,
+            })
+        })
+        .unwrap_or(false)
+}
+
+fn materialize_cached_outputs(value: &Value) -> Result<(), String> {
+    for file in output_file_records(value)? {
+        let Value::Record(file) = file else {
+            return Err(
+                "process.spawn cached result field `output_files` must contain records".to_string(),
+            );
+        };
+        let path = parse_bytes(
+            required_record_field(file, "path", PROCESS_SPAWN_OP)?,
+            "process.spawn cached output field `path` must be bytes",
+        )?;
+        let contents = match required_record_field(file, "contents", PROCESS_SPAWN_OP)? {
+            Value::Tagged { tag, fields }
+                if *tag == Symbol::from("ok") && matches!(fields.as_slice(), [Value::Bytes(_)]) =>
+            {
+                match fields.as_slice() {
+                    [Value::Bytes(contents)] => contents.clone(),
+                    _ => unreachable!("matches! checked field shape"),
+                }
+            }
+            _ => {
+                return Err(
+                    "process.spawn cached result did not contain complete declared outputs"
+                        .to_string(),
+                );
+            }
+        };
+
+        let path = path_from_bytes(path);
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            std::fs::create_dir_all(parent).map_err(|error| {
+                format!(
+                    "process.spawn failed to create output directory {}: {error}",
+                    parent.display()
+                )
+            })?;
+        }
+        std::fs::write(&path, contents).map_err(|error| {
+            format!(
+                "process.spawn failed to materialize cached output {}: {error}",
+                path.display()
+            )
+        })?;
+    }
+
+    Ok(())
+}
+
+fn output_file_records(value: &Value) -> Result<&[Value], String> {
+    let Value::Tagged { tag, fields } = value else {
+        return Err("process.spawn cached result must be tagged".to_string());
+    };
+    if *tag != Symbol::from("ok") {
+        return Err("process.spawn cached result must be ok".to_string());
+    }
+    let [Value::Record(record)] = fields.as_slice() else {
+        return Err("process.spawn cached result must contain one record".to_string());
+    };
+    let Value::List(files) = required_record_field(record, "output_files", PROCESS_SPAWN_OP)?
+    else {
+        return Err("process.spawn cached result field `output_files` must be a list".to_string());
+    };
+    Ok(files.as_slice())
 }
 
 fn exit_status_value(status: ExitStatus) -> Value {
@@ -1142,6 +1356,17 @@ mod tests {
         assert_eq!(
             host.effect_policy(&Symbol::from(PROCESS_SPAWN_OP)),
             HostEffectPolicy::declared()
+        );
+    }
+
+    #[test]
+    fn hermetic_process_spawn_is_registered_as_hermetic() {
+        let mut host = Host::new();
+        host.install_hermetic_process_spawn();
+
+        assert_eq!(
+            host.effect_policy(&Symbol::from(PROCESS_SPAWN_OP)),
+            HostEffectPolicy::hermetic()
         );
     }
 

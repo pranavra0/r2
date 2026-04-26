@@ -236,12 +236,73 @@ fn trace_command_reports_process_spawn_activity() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("yield: process.spawn"), "{stdout}");
     assert!(
-        stdout.contains("host handle: process.spawn [declared]"),
+        stdout.contains("host handle: process.spawn [hermetic]"),
         "{stdout}"
     );
     assert!(stdout.contains("result: ok({"), "{stdout}");
 
     let _ = std::fs::remove_file(program_path);
+}
+
+#[cfg(unix)]
+#[test]
+fn trace_command_caches_hermetic_process_spawn_thunks() {
+    let program_path = unique_temp_path("r2-cli-program-trace-process-cache", "r2");
+    let input_path = unique_temp_path("r2-cli-process-cache-input", "txt");
+    let output_path = unique_temp_path("r2-cli-process-cache-output", "txt");
+    let marker_path = unique_temp_path("r2-cli-process-cache-marker", "txt");
+    std::fs::write(&input_path, "cached via cli").expect("input should write");
+
+    let script = "cat \"$1\" > \"$2\"; printf 'run\\n' >> \"$3\"";
+    let request = format!(
+        "{{ argv: [{}, {}, {}, {}, {}, {}, {}], env_mode: {}, env: {{}}, stdin: {}, declared_inputs: [{}], declared_outputs: [{}] }}",
+        string_literal("/bin/sh"),
+        string_literal("-c"),
+        string_literal(script),
+        string_literal("sh"),
+        string_literal(input_path.to_string_lossy().as_ref()),
+        string_literal(output_path.to_string_lossy().as_ref()),
+        string_literal(marker_path.to_string_lossy().as_ref()),
+        string_literal("clear"),
+        string_literal(""),
+        string_literal(input_path.to_string_lossy().as_ref()),
+        string_literal(output_path.to_string_lossy().as_ref()),
+    );
+    std::fs::write(
+        &program_path,
+        format!(
+            "let thunk = lazy {{ perform process.spawn({request}) }}; let _ = force thunk; force thunk"
+        ),
+    )
+    .expect("program should write");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_r2"))
+        .arg("trace")
+        .arg("--memory-store")
+        .arg(&program_path)
+        .output()
+        .expect("cli should run");
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("result: ok({"), "{stdout}");
+    assert!(
+        stdout.contains("host handle: process.spawn [hermetic]"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("thunk cache store:"), "{stdout}");
+    assert!(stdout.contains("thunk cache hit:"), "{stdout}");
+    assert_eq!(
+        std::fs::read_to_string(&output_path).unwrap(),
+        "cached via cli"
+    );
+    assert_eq!(std::fs::read_to_string(&marker_path).unwrap(), "run\n");
+
+    let _ = std::fs::remove_file(program_path);
+    let _ = std::fs::remove_file(input_path);
+    let _ = std::fs::remove_file(output_path);
+    let _ = std::fs::remove_file(marker_path);
 }
 
 #[test]

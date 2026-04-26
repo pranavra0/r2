@@ -65,7 +65,7 @@ fn run_term<S: ObjectStore>(
     host.install_fs_write();
     host.install_clock();
     host.install_math();
-    host.install_process_spawn();
+    host.install_hermetic_process_spawn();
 
     if parsed.trace_requested {
         let traced = runtime
