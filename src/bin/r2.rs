@@ -64,6 +64,7 @@ fn run_term<S: ObjectStore>(
     host.install_fs_read();
     host.install_fs_write();
     host.install_clock();
+    host.install_math();
     host.install_process_spawn();
 
     if parsed.trace_requested {

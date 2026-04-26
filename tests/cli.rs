@@ -299,7 +299,10 @@ fn trace_command_reports_stable_math_effects() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("result: 5\n"), "{stdout}");
     assert!(stdout.contains("yield: math.add"), "{stdout}");
-    assert!(stdout.contains("host handle: math.add [stable]"), "{stdout}");
+    assert!(
+        stdout.contains("host handle: math.add [stable]"),
+        "{stdout}"
+    );
 
     let _ = std::fs::remove_file(program_path);
 }

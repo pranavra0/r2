@@ -348,6 +348,86 @@ pub mod clock {
     }
 }
 
+pub mod math {
+    use super::*;
+
+    pub const ADD_OP: &str = "math.add";
+    pub const SUB_OP: &str = "math.sub";
+    pub const MUL_OP: &str = "math.mul";
+    pub const DIV_OP: &str = "math.div";
+    pub const REM_OP: &str = "math.rem";
+    pub const EQ_OP: &str = "math.eq";
+    pub const NE_OP: &str = "math.ne";
+    pub const LT_OP: &str = "math.lt";
+    pub const LE_OP: &str = "math.le";
+    pub const GT_OP: &str = "math.gt";
+    pub const GE_OP: &str = "math.ge";
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum BinaryOp {
+        Add,
+        Sub,
+        Mul,
+        Div,
+        Rem,
+        Eq,
+        Ne,
+        Lt,
+        Le,
+        Gt,
+        Ge,
+    }
+
+    impl BinaryOp {
+        pub fn effect_op(self) -> &'static str {
+            match self {
+                Self::Add => ADD_OP,
+                Self::Sub => SUB_OP,
+                Self::Mul => MUL_OP,
+                Self::Div => DIV_OP,
+                Self::Rem => REM_OP,
+                Self::Eq => EQ_OP,
+                Self::Ne => NE_OP,
+                Self::Lt => LT_OP,
+                Self::Le => LE_OP,
+                Self::Gt => GT_OP,
+                Self::Ge => GE_OP,
+            }
+        }
+    }
+
+    pub fn binary(op: BinaryOp, left: Term, right: Term) -> Term {
+        Term::Perform {
+            op: Symbol::from(op.effect_op()),
+            args: vec![left, right],
+        }
+    }
+
+    pub fn add(left: Term, right: Term) -> Term {
+        binary(BinaryOp::Add, left, right)
+    }
+
+    pub fn sub(left: Term, right: Term) -> Term {
+        binary(BinaryOp::Sub, left, right)
+    }
+
+    pub fn mul(left: Term, right: Term) -> Term {
+        binary(BinaryOp::Mul, left, right)
+    }
+
+    pub fn div(left: Term, right: Term) -> Term {
+        binary(BinaryOp::Div, left, right)
+    }
+
+    pub fn rem(left: Term, right: Term) -> Term {
+        binary(BinaryOp::Rem, left, right)
+    }
+
+    pub fn eq(left: Term, right: Term) -> Term {
+        binary(BinaryOp::Eq, left, right)
+    }
+}
+
 pub mod process {
     use super::*;
 
@@ -633,8 +713,9 @@ mod tests {
         ErrorKind as FsErrorKind, ReadRequest, ReadResult, WriteRequest, WriteResult,
         decode_read_result, decode_write_result,
     };
+    use super::math::{self, BinaryOp};
     use super::process::{DeclaredOutputFile, ProcessStatus, SpawnRequest, decode_result};
-    use crate::{Symbol, Value};
+    use crate::{Symbol, Term, Value};
     use std::collections::BTreeMap;
 
     #[test]
@@ -733,6 +814,26 @@ mod tests {
 
         assert_eq!(decode_now_result(&now_value).unwrap().unix_nanos, 42);
         assert_eq!(decode_sleep_result(&sleep_value).unwrap().duration_nanos, 7);
+    }
+
+    #[test]
+    fn math_requests_build_explicit_binary_effects() {
+        let term = math::binary(
+            BinaryOp::Add,
+            Term::Value(Value::Integer(2)),
+            Term::Value(Value::Integer(3)),
+        );
+
+        assert_eq!(
+            term,
+            Term::Perform {
+                op: Symbol::from("math.add"),
+                args: vec![
+                    Term::Value(Value::Integer(2)),
+                    Term::Value(Value::Integer(3))
+                ],
+            }
+        );
     }
 
     #[test]

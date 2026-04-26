@@ -13,8 +13,7 @@ fn if_matches_boolean_symbols() {
 
 #[test]
 fn match_supports_symbols_and_wildcards() {
-    let term =
-        parse_program("match :left { :right => 1; _ => 2 }").expect("program should parse");
+    let term = parse_program("match :left { :right => 1; _ => 2 }").expect("program should parse");
     let result = eval(term).expect("program should evaluate");
 
     assert_integer(result, 2);
@@ -22,9 +21,10 @@ fn match_supports_symbols_and_wildcards() {
 
 #[test]
 fn let_rec_can_call_itself_through_match() {
-    let term =
-        parse_program("let rec loop = fn(x) => match x { :done => 1; _ => loop(:done) }; loop(:go)")
-            .expect("program should parse");
+    let term = parse_program(
+        "let rec loop = fn(x) => match x { :done => 1; _ => loop(:done) }; loop(:go)",
+    )
+    .expect("program should parse");
     let result = eval(term).expect("program should evaluate");
 
     assert_integer(result, 1);

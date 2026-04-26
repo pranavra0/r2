@@ -876,7 +876,7 @@ impl<'a> Parser<'a> {
 
     fn parse_perform(&mut self) -> Result<Expr, SyntaxError> {
         if !matches!(self.peek().kind, TokenKind::Perform) {
-            return self.parse_force();
+            return self.parse_comparison();
         }
 
         let start = self.next().span;
@@ -889,6 +889,83 @@ impl<'a> Parser<'a> {
             kind: ExprKind::Perform { op, args },
             span: start.join(end),
         })
+    }
+
+    fn parse_comparison(&mut self) -> Result<Expr, SyntaxError> {
+        let mut expr = self.parse_additive()?;
+
+        loop {
+            let op = match self.peek().kind {
+                TokenKind::EqualEqual => BinaryOp::Eq,
+                TokenKind::BangEqual => BinaryOp::NotEq,
+                TokenKind::Less => BinaryOp::Less,
+                TokenKind::LessEqual => BinaryOp::LessEq,
+                TokenKind::Greater => BinaryOp::Greater,
+                TokenKind::GreaterEqual => BinaryOp::GreaterEq,
+                _ => return Ok(expr),
+            };
+
+            self.next();
+            let right = self.parse_additive()?;
+            let span = expr.span.join(right.span);
+            expr = Expr {
+                kind: ExprKind::Binary {
+                    op,
+                    left: Box::new(expr),
+                    right: Box::new(right),
+                },
+                span,
+            };
+        }
+    }
+
+    fn parse_additive(&mut self) -> Result<Expr, SyntaxError> {
+        let mut expr = self.parse_multiplicative()?;
+
+        loop {
+            let op = match self.peek().kind {
+                TokenKind::Plus => BinaryOp::Add,
+                TokenKind::Minus => BinaryOp::Sub,
+                _ => return Ok(expr),
+            };
+
+            self.next();
+            let right = self.parse_multiplicative()?;
+            let span = expr.span.join(right.span);
+            expr = Expr {
+                kind: ExprKind::Binary {
+                    op,
+                    left: Box::new(expr),
+                    right: Box::new(right),
+                },
+                span,
+            };
+        }
+    }
+
+    fn parse_multiplicative(&mut self) -> Result<Expr, SyntaxError> {
+        let mut expr = self.parse_force()?;
+
+        loop {
+            let op = match self.peek().kind {
+                TokenKind::Star => BinaryOp::Mul,
+                TokenKind::Slash => BinaryOp::Div,
+                TokenKind::Percent => BinaryOp::Rem,
+                _ => return Ok(expr),
+            };
+
+            self.next();
+            let right = self.parse_force()?;
+            let span = expr.span.join(right.span);
+            expr = Expr {
+                kind: ExprKind::Binary {
+                    op,
+                    left: Box::new(expr),
+                    right: Box::new(right),
+                },
+                span,
+            };
+        }
     }
 
     fn parse_force(&mut self) -> Result<Expr, SyntaxError> {
@@ -1219,6 +1296,13 @@ fn lower_expr(source: &str, expr: &Expr, env: &mut Vec<String>) -> Result<Term, 
                 .map(|arg| lower_expr(source, arg, env))
                 .collect::<Result<Vec<_>, _>>()?,
         }),
+        ExprKind::Binary { op, left, right } => Ok(Term::Perform {
+            op: op.effect_op(),
+            args: vec![
+                lower_expr(source, left, env)?,
+                lower_expr(source, right, env)?,
+            ],
+        }),
         ExprKind::Perform { op, args } => Ok(Term::Perform {
             op: op.clone(),
             args: args
@@ -1418,6 +1502,7 @@ fn literal_restriction_name(expr: &Expr) -> &'static str {
         ExprKind::LetRec { .. } => "a recursive let expression",
         ExprKind::Lambda { .. } => "a function",
         ExprKind::Call { .. } => "a function call",
+        ExprKind::Binary { .. } => "an operator expression",
         ExprKind::Perform { .. } => "an effect request",
         ExprKind::Handle { .. } => "a handler block",
         ExprKind::Match { .. } => "a match expression",

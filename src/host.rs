@@ -16,6 +16,17 @@ const FS_WRITE_OP: &str = "fs.write";
 const PROCESS_SPAWN_OP: &str = "process.spawn";
 const CLOCK_NOW_OP: &str = "clock.now";
 const CLOCK_SLEEP_OP: &str = "clock.sleep";
+const MATH_ADD_OP: &str = "math.add";
+const MATH_SUB_OP: &str = "math.sub";
+const MATH_MUL_OP: &str = "math.mul";
+const MATH_DIV_OP: &str = "math.div";
+const MATH_REM_OP: &str = "math.rem";
+const MATH_EQ_OP: &str = "math.eq";
+const MATH_NE_OP: &str = "math.ne";
+const MATH_LT_OP: &str = "math.lt";
+const MATH_LE_OP: &str = "math.le";
+const MATH_GT_OP: &str = "math.gt";
+const MATH_GE_OP: &str = "math.ge";
 const ENV_MODE_CLEAR: &str = "clear";
 const ENV_MODE_INHERIT: &str = "inherit";
 
@@ -205,6 +216,65 @@ impl Host {
 
     pub fn install_clock_sleep(&mut self) {
         self.register(CLOCK_SLEEP_OP, clock_sleep_handler);
+    }
+
+    pub fn install_math(&mut self) {
+        self.register_stable(MATH_ADD_OP, |args, continuation| {
+            math_integer_handler(args, continuation, MATH_ADD_OP, |left, right| {
+                left.checked_add(right)
+                    .ok_or_else(|| "math.add overflowed i64".to_string())
+            })
+        });
+        self.register_stable(MATH_SUB_OP, |args, continuation| {
+            math_integer_handler(args, continuation, MATH_SUB_OP, |left, right| {
+                left.checked_sub(right)
+                    .ok_or_else(|| "math.sub overflowed i64".to_string())
+            })
+        });
+        self.register_stable(MATH_MUL_OP, |args, continuation| {
+            math_integer_handler(args, continuation, MATH_MUL_OP, |left, right| {
+                left.checked_mul(right)
+                    .ok_or_else(|| "math.mul overflowed i64".to_string())
+            })
+        });
+        self.register_stable(MATH_DIV_OP, |args, continuation| {
+            math_integer_handler(args, continuation, MATH_DIV_OP, |left, right| {
+                if right == 0 {
+                    Err("math.div cannot divide by zero".to_string())
+                } else {
+                    left.checked_div(right)
+                        .ok_or_else(|| "math.div overflowed i64".to_string())
+                }
+            })
+        });
+        self.register_stable(MATH_REM_OP, |args, continuation| {
+            math_integer_handler(args, continuation, MATH_REM_OP, |left, right| {
+                if right == 0 {
+                    Err("math.rem cannot divide by zero".to_string())
+                } else {
+                    left.checked_rem(right)
+                        .ok_or_else(|| "math.rem overflowed i64".to_string())
+                }
+            })
+        });
+        self.register_stable(MATH_EQ_OP, |args, continuation| {
+            math_compare_handler(args, continuation, MATH_EQ_OP, |left, right| left == right)
+        });
+        self.register_stable(MATH_NE_OP, |args, continuation| {
+            math_compare_handler(args, continuation, MATH_NE_OP, |left, right| left != right)
+        });
+        self.register_stable(MATH_LT_OP, |args, continuation| {
+            math_compare_handler(args, continuation, MATH_LT_OP, |left, right| left < right)
+        });
+        self.register_stable(MATH_LE_OP, |args, continuation| {
+            math_compare_handler(args, continuation, MATH_LE_OP, |left, right| left <= right)
+        });
+        self.register_stable(MATH_GT_OP, |args, continuation| {
+            math_compare_handler(args, continuation, MATH_GT_OP, |left, right| left > right)
+        });
+        self.register_stable(MATH_GE_OP, |args, continuation| {
+            math_compare_handler(args, continuation, MATH_GE_OP, |left, right| left >= right)
+        });
     }
 }
 
@@ -413,6 +483,46 @@ fn clock_sleep_handler(
     };
 
     continuation.resume(value).map_err(Into::into)
+}
+
+fn math_integer_handler(
+    args: Vec<RuntimeValue>,
+    continuation: Continuation,
+    op: &str,
+    operation: impl FnOnce(i64, i64) -> Result<i64, String>,
+) -> Result<EvalResult, HostError> {
+    let value = match parse_math_integer_args(args.as_slice(), op).and_then(|(left, right)| {
+        operation(left, right).map(|value| RuntimeValue::Data(Value::Integer(value)))
+    }) {
+        Ok(value) => value,
+        Err(message) => error_value(message),
+    };
+
+    continuation.resume(value).map_err(Into::into)
+}
+
+fn math_compare_handler(
+    args: Vec<RuntimeValue>,
+    continuation: Continuation,
+    op: &str,
+    operation: impl FnOnce(i64, i64) -> bool,
+) -> Result<EvalResult, HostError> {
+    let value = match parse_math_integer_args(args.as_slice(), op) {
+        Ok((left, right)) => RuntimeValue::Data(boolean_value(operation(left, right))),
+        Err(message) => error_value(message),
+    };
+
+    continuation.resume(value).map_err(Into::into)
+}
+
+fn parse_math_integer_args(args: &[RuntimeValue], op: &str) -> Result<(i64, i64), String> {
+    match args {
+        [RuntimeValue::Data(left), RuntimeValue::Data(right)] => Ok((
+            parse_integer(left, &format!("{op} left argument must be an integer"))?,
+            parse_integer(right, &format!("{op} right argument must be an integer"))?,
+        )),
+        _ => Err(format!("{op} expected two integer arguments")),
+    }
 }
 
 fn run_process_request(request: &BTreeMap<Symbol, Value>) -> Result<RuntimeValue, String> {
@@ -728,6 +838,10 @@ fn tagged_record_value(
 
 fn ok_record_value(entries: impl IntoIterator<Item = (&'static str, Value)>) -> Value {
     tagged_record_value("ok", entries)
+}
+
+fn boolean_value(value: bool) -> Value {
+    Value::Symbol(Symbol::from(if value { "true" } else { "false" }))
 }
 
 fn error_value(message: impl Into<String>) -> RuntimeValue {
