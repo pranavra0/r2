@@ -1243,7 +1243,8 @@ fn lower_expr(source: &str, expr: &Expr, env: &mut Vec<String>) -> Result<Term, 
             "false"
         })))),
         ExprKind::Symbol(symbol) => Ok(Term::Value(Value::Symbol(symbol.clone()))),
-        ExprKind::List(_) | ExprKind::Record(_) => Ok(Term::Value(lower_value(source, expr)?)),
+        ExprKind::List(items) => lower_list(source, items, env),
+        ExprKind::Record(fields) => lower_record(source, expr.span.start, fields, env),
         ExprKind::Let { name, value, body } => {
             let lowered_value = lower_expr(source, value, env)?;
             env.push(name.clone());
@@ -1289,13 +1290,21 @@ fn lower_expr(source: &str, expr: &Expr, env: &mut Vec<String>) -> Result<Term, 
             env.truncate(env.len() - params.len());
             Ok(Term::lambda(arity, lowered_body))
         }
-        ExprKind::Call { callee, args } => Ok(Term::Apply {
-            callee: Box::new(lower_expr(source, callee, env)?),
-            args: args
-                .iter()
-                .map(|arg| lower_expr(source, arg, env))
-                .collect::<Result<Vec<_>, _>>()?,
-        }),
+        ExprKind::Call { callee, args } => {
+            if let ExprKind::Name(name) = &callee.kind
+                && !env.iter().any(|binding| binding == name)
+            {
+                return lower_tagged_constructor(source, expr.span.start, name, args);
+            }
+
+            Ok(Term::Apply {
+                callee: Box::new(lower_expr(source, callee, env)?),
+                args: args
+                    .iter()
+                    .map(|arg| lower_expr(source, arg, env))
+                    .collect::<Result<Vec<_>, _>>()?,
+            })
+        }
         ExprKind::Binary { op, left, right } => Ok(Term::Perform {
             op: op.effect_op(),
             args: vec![
@@ -1376,6 +1385,85 @@ fn lower_rec_binding(
     let body = lower_expr(source, &binding.body, env)?;
     env.truncate(env.len() - binding.params.len());
     Ok(RecBinding::new(Lambda::new(arity, body)))
+}
+
+fn lower_list(source: &str, items: &[Expr], env: &mut Vec<String>) -> Result<Term, SyntaxError> {
+    if let Some(value) = try_lower_static_value(
+        source,
+        &Expr {
+            kind: ExprKind::List(items.to_vec()),
+            span: Span { start: 0, end: 0 },
+        },
+    )? {
+        return Ok(Term::Value(value));
+    }
+
+    Ok(Term::List(
+        items
+            .iter()
+            .map(|item| lower_expr(source, item, env))
+            .collect::<Result<Vec<_>, _>>()?,
+    ))
+}
+
+fn lower_record(
+    source: &str,
+    offset: usize,
+    fields: &[(String, Expr)],
+    env: &mut Vec<String>,
+) -> Result<Term, SyntaxError> {
+    if let Some(value) = try_lower_static_value(
+        source,
+        &Expr {
+            kind: ExprKind::Record(fields.to_vec()),
+            span: Span {
+                start: offset,
+                end: offset,
+            },
+        },
+    )? {
+        return Ok(Term::Value(value));
+    }
+
+    let mut lowered = BTreeMap::new();
+    for (name, value) in fields {
+        let key = Symbol::from(name.clone());
+        if lowered.contains_key(&key) {
+            return Err(SyntaxError::new(
+                source,
+                offset,
+                format!("duplicate record field `{name}`"),
+            ));
+        }
+        lowered.insert(key, lower_expr(source, value, env)?);
+    }
+
+    Ok(Term::Record(lowered))
+}
+
+fn lower_tagged_constructor(
+    source: &str,
+    offset: usize,
+    tag: &str,
+    args: &[Expr],
+) -> Result<Term, SyntaxError> {
+    let fields = args
+        .iter()
+        .map(|arg| {
+            lower_value(source, arg).map_err(|_| {
+                SyntaxError::new(
+                    source,
+                    offset,
+                    "tagged constructor fields must be static values for now",
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(Term::Value(Value::Tagged {
+        tag: Symbol::from(tag.to_string()),
+        fields,
+    }))
 }
 
 fn lower_match_branch(
@@ -1484,6 +1572,23 @@ fn lower_value(source: &str, expr: &Expr) -> Result<Value, SyntaxError> {
             }
             Ok(Value::Record(entries))
         }
+        ExprKind::Call { callee, args } => {
+            let ExprKind::Name(tag) = &callee.kind else {
+                return Err(SyntaxError::new(
+                    source,
+                    expr.span.start,
+                    "only tagged constructors can appear inside data literals",
+                ));
+            };
+
+            Ok(Value::Tagged {
+                tag: Symbol::from(tag.clone()),
+                fields: args
+                    .iter()
+                    .map(|arg| lower_value(source, arg))
+                    .collect::<Result<Vec<_>, _>>()?,
+            })
+        }
         _ => Err(SyntaxError::new(
             source,
             expr.span.start,
@@ -1492,6 +1597,20 @@ fn lower_value(source: &str, expr: &Expr) -> Result<Value, SyntaxError> {
                 literal_restriction_name(expr)
             ),
         )),
+    }
+}
+
+fn try_lower_static_value(source: &str, expr: &Expr) -> Result<Option<Value>, SyntaxError> {
+    match lower_value(source, expr) {
+        Ok(value) => Ok(Some(value)),
+        Err(error)
+            if error
+                .message
+                .contains("cannot appear inside a data literal yet") =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -1603,12 +1722,9 @@ mod tests {
     }
 
     #[test]
-    fn rejects_dynamic_values_inside_records_for_now() {
-        let error = parse("{ value: x }").expect_err("record should reject variable values");
-        assert!(
-            error
-                .to_string()
-                .contains("variable reference cannot appear inside a data literal yet")
-        );
+    fn dynamic_values_inside_records_lower_to_record_terms() {
+        let term = parse("let x = 5; { value: x }").expect("record should parse");
+
+        assert!(matches!(term, Term::Apply { args: _, callee: _ }));
     }
 }

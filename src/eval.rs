@@ -201,6 +201,18 @@ enum Frame {
         branches: Vec<CaseBranch>,
         env: Env,
     },
+    ListItems {
+        items: Vec<Term>,
+        next_index: usize,
+        evaluated: Vec<Value>,
+        env: Env,
+    },
+    RecordFields {
+        fields: Vec<(Symbol, Term)>,
+        next_index: usize,
+        evaluated: Vec<(Symbol, Value)>,
+        env: Env,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -253,6 +265,7 @@ pub enum EvalError {
     NonCallable(RuntimeValue),
     WrongArity { expected: usize, found: usize },
     UnmatchedCase { shape: String },
+    NonDataLiteralValue(RuntimeValue),
     ContinuationAlreadyResumed,
     EmptyScopeStack,
 }
@@ -276,6 +289,9 @@ impl fmt::Display for EvalError {
             }
             Self::UnmatchedCase { shape } => {
                 write!(f, "unmatched case for {shape}")
+            }
+            Self::NonDataLiteralValue(value) => {
+                write!(f, "record/list item evaluated to non-data value {value:?}")
             }
             Self::ContinuationAlreadyResumed => {
                 f.write_str("continuations are one-shot and may only be resumed once")
@@ -417,6 +433,34 @@ impl Machine {
                 })?;
                 self.control = Control::Term(*scrutinee, env);
             }
+            Term::Record(fields) => {
+                let fields = fields.into_iter().collect::<Vec<_>>();
+                if fields.is_empty() {
+                    self.control =
+                        Control::Value(RuntimeValue::Data(Value::Record(BTreeMap::new())));
+                } else {
+                    self.push_frame(Frame::RecordFields {
+                        fields: fields.clone(),
+                        next_index: 1,
+                        evaluated: Vec::new(),
+                        env: env.clone(),
+                    })?;
+                    self.control = Control::Term(fields[0].1.clone(), env);
+                }
+            }
+            Term::List(items) => {
+                if items.is_empty() {
+                    self.control = Control::Value(RuntimeValue::Data(Value::List(Vec::new())));
+                } else {
+                    self.push_frame(Frame::ListItems {
+                        items: items.clone(),
+                        next_index: 1,
+                        evaluated: Vec::new(),
+                        env: env.clone(),
+                    })?;
+                    self.control = Control::Term(items[0].clone(), env);
+                }
+            }
         }
 
         Ok(None)
@@ -498,6 +542,49 @@ impl Machine {
                 let mut branch_env = env;
                 branch_env.extend(bindings);
                 self.control = Control::Term(body, branch_env);
+            }
+            Frame::ListItems {
+                items,
+                next_index,
+                mut evaluated,
+                env,
+            } => {
+                evaluated.push(expect_data_value(value)?);
+
+                if next_index < items.len() {
+                    self.push_frame(Frame::ListItems {
+                        items: items.clone(),
+                        next_index: next_index + 1,
+                        evaluated,
+                        env: env.clone(),
+                    })?;
+                    self.control = Control::Term(items[next_index].clone(), env);
+                } else {
+                    self.control = Control::Value(RuntimeValue::Data(Value::List(evaluated)));
+                }
+            }
+            Frame::RecordFields {
+                fields,
+                next_index,
+                mut evaluated,
+                env,
+            } => {
+                let key = fields[next_index - 1].0.clone();
+                evaluated.push((key, expect_data_value(value)?));
+
+                if next_index < fields.len() {
+                    self.push_frame(Frame::RecordFields {
+                        fields: fields.clone(),
+                        next_index: next_index + 1,
+                        evaluated,
+                        env: env.clone(),
+                    })?;
+                    self.control = Control::Term(fields[next_index].1.clone(), env);
+                } else {
+                    self.control = Control::Value(RuntimeValue::Data(Value::Record(
+                        evaluated.into_iter().collect(),
+                    )));
+                }
             }
         }
 
@@ -717,6 +804,25 @@ fn close_term(term: &Term, depth: u32, captured: &[Term]) -> Option<Term> {
                 })
                 .collect::<Option<Vec<_>>>()?,
         }),
+        Term::Record(fields) => Some(Term::Record(
+            fields
+                .iter()
+                .map(|(key, value)| Some((key.clone(), close_term(value, depth, captured)?)))
+                .collect::<Option<BTreeMap<_, _>>>()?,
+        )),
+        Term::List(items) => Some(Term::List(
+            items
+                .iter()
+                .map(|item| close_term(item, depth, captured))
+                .collect::<Option<Vec<_>>>()?,
+        )),
+    }
+}
+
+fn expect_data_value(value: RuntimeValue) -> Result<Value, EvalError> {
+    match value {
+        RuntimeValue::Data(value) => Ok(value),
+        _ => Err(EvalError::NonDataLiteralValue(value)),
     }
 }
 

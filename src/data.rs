@@ -388,6 +388,8 @@ pub enum Term {
         scrutinee: Box<Term>,
         branches: Vec<CaseBranch>,
     },
+    Record(BTreeMap<Symbol, Term>),
+    List(Vec<Term>),
 }
 
 impl Term {
@@ -440,6 +442,8 @@ impl Term {
                             .is_closed_at(depth.saturating_add(branch.pattern.bindings()))
                     })
             }
+            Self::Record(fields) => fields.values().all(|value| value.is_closed_at(depth)),
+            Self::List(items) => items.iter().all(|item| item.is_closed_at(depth)),
         }
     }
 }
@@ -505,6 +509,21 @@ impl Canonical for Term {
                 write_len(out, branches.len());
                 for branch in branches {
                     branch.write_canonical(out);
+                }
+            }
+            Self::Record(fields) => {
+                out.push(0x19);
+                write_len(out, fields.len());
+                for (key, value) in fields {
+                    key.write_canonical(out);
+                    value.write_canonical(out);
+                }
+            }
+            Self::List(items) => {
+                out.push(0x1a);
+                write_len(out, items.len());
+                for item in items {
+                    item.write_canonical(out);
                 }
             }
         }

@@ -134,6 +134,61 @@ fn integer_factorial_runs_with_recursion_and_arithmetic() {
     assert_runtime_integer(result, 120);
 }
 
+#[test]
+fn dynamic_record_fields_evaluate_to_records() {
+    let result = run("{path: \"/tmp/a\", contents: 2 + 3}");
+
+    match result {
+        RuntimeValue::Data(Value::Record(record)) => {
+            assert_eq!(
+                record.get(&Symbol::from("path")),
+                Some(&Value::Bytes(b"/tmp/a".to_vec()))
+            );
+            assert_eq!(
+                record.get(&Symbol::from("contents")),
+                Some(&Value::Integer(5))
+            );
+        }
+        other => panic!("unexpected value: {other:?}"),
+    }
+}
+
+#[test]
+fn dynamic_list_items_evaluate_to_lists() {
+    let result = run("[1, 2 + 3, 4]");
+
+    match result {
+        RuntimeValue::Data(Value::List(items)) => assert_eq!(
+            items,
+            vec![Value::Integer(1), Value::Integer(5), Value::Integer(4)]
+        ),
+        other => panic!("unexpected value: {other:?}"),
+    }
+}
+
+#[test]
+fn static_and_dynamic_record_terms_normalize_to_the_same_value_digest() {
+    let static_value = run("{value: 5}");
+    let dynamic_value = run("{value: 2 + 3}");
+
+    match (static_value, dynamic_value) {
+        (RuntimeValue::Data(static_value), RuntimeValue::Data(dynamic_value)) => {
+            assert_eq!(static_value, dynamic_value);
+            assert_eq!(static_value.digest(), dynamic_value.digest());
+        }
+        other => panic!("unexpected values: {other:?}"),
+    }
+}
+
+#[test]
+fn recursive_list_traversal_runs() {
+    let result = run(
+        "let rec length = fn(xs) => match xs { nil() => 0; cons(_, tail) => 1 + length(tail) }; length(cons(1, cons(2, nil())))",
+    );
+
+    assert_runtime_integer(result, 2);
+}
+
 fn assert_integer(result: EvalResult, expected: i64) {
     match result {
         EvalResult::Done(RuntimeValue::Data(Value::Integer(value))) => assert_eq!(value, expected),
