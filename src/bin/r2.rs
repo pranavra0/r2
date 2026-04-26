@@ -313,6 +313,10 @@ fn print_trace_summary(summary: &RuntimeTraceSummary) {
         summary.service_stops
     );
     println!(
+        "- thunk forces: single {}, batches {}",
+        summary.thunk_forces, summary.thunk_force_all
+    );
+    println!(
         "- thunk cache: hits {}, stores {}, bypasses {}",
         summary.thunk_cache_hits, summary.thunk_cache_stores, summary.thunk_cache_bypasses
     );

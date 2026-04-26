@@ -3,6 +3,7 @@ use std::fmt;
 use crate::{Symbol, Term};
 
 pub const FORCE_OP: &str = "thunk.force";
+pub const FORCE_ALL_OP: &str = "thunk.force_all";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ThunkError {
@@ -47,5 +48,12 @@ pub fn force(thunk: Term) -> Term {
     Term::Apply {
         callee: Box::new(thunk),
         args: Vec::new(),
+    }
+}
+
+pub fn force_all(thunks: impl IntoIterator<Item = Term>) -> Term {
+    Term::Perform {
+        op: Symbol::from(FORCE_ALL_OP),
+        args: thunks.into_iter().collect(),
     }
 }

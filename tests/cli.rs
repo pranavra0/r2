@@ -178,6 +178,39 @@ fn trace_command_reports_pure_thunk_cache_hits() {
 }
 
 #[test]
+fn trace_command_reports_force_all_batches() {
+    let program_path = unique_temp_path("r2-cli-program-trace-force-all", "r2");
+    std::fs::write(
+        &program_path,
+        "perform thunk.force_all(lazy { 1 }, lazy { 2 })",
+    )
+    .expect("program should write");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_r2"))
+        .arg("trace")
+        .arg("--summary")
+        .arg("--memory-store")
+        .arg(&program_path)
+        .output()
+        .expect("cli should run");
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("result: [1, 2]\n"), "{stdout}");
+    assert!(stdout.contains("- thunk forces: single "), "{stdout}");
+    assert!(stdout.contains("batches 1"), "{stdout}");
+    assert!(stdout.contains("yield: thunk.force_all"), "{stdout}");
+    assert!(stdout.contains("thunk force_all: 2"), "{stdout}");
+    assert!(
+        stdout.contains("builtin handle: thunk.force_all"),
+        "{stdout}"
+    );
+
+    let _ = std::fs::remove_file(program_path);
+}
+
+#[test]
 fn trace_command_reports_runtime_and_volatile_thunk_activity() {
     let program_path = unique_temp_path("r2-cli-program-trace", "r2");
     let target_path = unique_temp_path("r2-cli-trace-output", "txt");

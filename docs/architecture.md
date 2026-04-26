@@ -80,12 +80,17 @@ and `store gc`.
 1. `Runtime::run*` calls `eval`.
 2. `eval` returns either `Done(value)` or `Yielded(effect)`.
 3. The runtime records `yield`.
-4. Built-ins get first chance. Today the important built-in is `thunk.force`.
+4. Built-ins get first chance. Today the important built-ins are
+   `thunk.force` and the internal batch form `thunk.force_all`.
 5. Otherwise, the host handles the effect and returns the next `EvalResult`.
 6. The runtime records host policy and continues until `Done`.
 
-Thunk caching happens inside the built-in `thunk.force` path. A thunk is cached
+Thunk caching happens inside the built-in thunk forcing path. A thunk is cached
 only if the whole forced computation avoids non-cacheable host effects.
+`thunk.force_all` is a semantic bridge for build DAG frontiers: it forces a
+batch of independent thunks and returns their data results as a list. It is
+sequential today, but gives the scheduler one explicit place to add parallel
+forcing without adding a graph primitive to the core calculus.
 
 ## Store Model
 

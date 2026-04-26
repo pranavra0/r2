@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use r2::{BuildAction, BuildArtifact, BuildGraph, Host, Runtime, RuntimeValue, Symbol, Value};
 
@@ -78,6 +78,13 @@ fn build_graph_compiles_and_links_a_small_c_project() {
             .last(),
         Some(&binary_handle)
     );
+    let layers = graph
+        .topological_layers()
+        .expect("topological layers should resolve");
+    assert_eq!(layers.len(), 3);
+    assert_eq!(layers[0], source_handles);
+    assert_eq!(layers[1], object_handles);
+    assert_eq!(layers[2], vec![binary_handle]);
     let dot = graph.render_dot();
     assert!(dot.starts_with("digraph build {"));
     assert!(dot.contains("target:binary"));
@@ -85,16 +92,77 @@ fn build_graph_compiles_and_links_a_small_c_project() {
     let mut runtime = Runtime::new();
     let mut host = Host::new();
     host.install_hermetic_process_spawn();
-    let result = runtime
-        .run(graph.to_term().expect("graph should lower"), &mut host)
+    let traced = runtime
+        .run_with_trace(graph.to_term().expect("graph should lower"), &mut host)
         .expect("graph term should run");
+    assert_eq!(traced.trace.summary().thunk_force_all, 1);
 
-    assert_target_succeeded(result);
+    assert_target_succeeded(traced.value);
     let output = Command::new(&binary)
         .output()
         .expect("linked binary should run");
     assert!(output.status.success(), "stderr: {}", stderr(&output));
     assert_eq!(String::from_utf8(output.stdout).unwrap(), "10\n");
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn independent_slow_graph_actions_capture_current_sequential_baseline() {
+    let Some(shell) = command_path("sh") else {
+        eprintln!("skipping slow graph baseline because no sh was found");
+        return;
+    };
+
+    let root = unique_temp_dir("r2-build-graph-slow");
+    std::fs::create_dir_all(&root).expect("temp dir should create");
+    let mut graph = BuildGraph::new();
+    let mut handles = Vec::new();
+
+    for index in 0..4 {
+        let output = root.join(format!("out-{index}.txt"));
+        handles.push(
+            graph.action(
+                BuildAction::new(vec![
+                    path_bytes(&shell),
+                    b"-c".to_vec(),
+                    b"sleep 0.1; printf ok > \"$1\"".to_vec(),
+                    b"sh".to_vec(),
+                    path_bytes(&output),
+                ])
+                .inherit_env()
+                .output(BuildArtifact::new(path_bytes(&output))),
+            ),
+        );
+    }
+    for (index, handle) in handles.iter().enumerate() {
+        graph
+            .target(format!("out_{index}"), *handle)
+            .expect("target should register");
+    }
+
+    assert_eq!(
+        graph.topological_layers().expect("layers should resolve"),
+        vec![handles]
+    );
+
+    let mut runtime = Runtime::new();
+    let mut host = Host::new();
+    host.install_hermetic_process_spawn();
+    let started = Instant::now();
+    let result = runtime
+        .run(graph.to_term().expect("graph should lower"), &mut host)
+        .expect("graph term should run");
+    let elapsed = started.elapsed();
+
+    let RuntimeValue::Data(Value::Record(targets)) = result else {
+        panic!("unexpected graph result");
+    };
+    assert_eq!(targets.len(), 4);
+    assert!(
+        elapsed >= Duration::from_millis(350),
+        "current runtime should still be sequential before §2.0 parallelism; elapsed {elapsed:?}"
+    );
 
     let _ = std::fs::remove_dir_all(root);
 }

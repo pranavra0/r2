@@ -182,6 +182,9 @@ pub enum RuntimeTraceEvent {
     ThunkForce {
         key: Digest,
     },
+    ThunkForceAll {
+        count: usize,
+    },
     ThunkCacheHit {
         key: Digest,
     },
@@ -236,6 +239,7 @@ impl fmt::Display for RuntimeTraceEvent {
             ),
             Self::UnhandledEffect { op } => write!(f, "unhandled effect: {op}"),
             Self::ThunkForce { key } => write!(f, "thunk force: {key}"),
+            Self::ThunkForceAll { count } => write!(f, "thunk force_all: {count}"),
             Self::ThunkCacheHit { key } => write!(f, "thunk cache hit: {key}"),
             Self::ThunkCacheStore { key } => write!(f, "thunk cache store: {key}"),
             Self::ThunkCacheBypass {
@@ -318,6 +322,7 @@ impl RuntimeTrace {
                 RuntimeTraceEvent::ServiceStop { .. } => summary.service_stops += 1,
                 RuntimeTraceEvent::UnhandledEffect { .. } => summary.unhandled_effects += 1,
                 RuntimeTraceEvent::ThunkForce { .. } => summary.thunk_forces += 1,
+                RuntimeTraceEvent::ThunkForceAll { .. } => summary.thunk_force_all += 1,
                 RuntimeTraceEvent::ThunkCacheHit { .. } => summary.thunk_cache_hits += 1,
                 RuntimeTraceEvent::ThunkCacheStore { .. } => summary.thunk_cache_stores += 1,
                 RuntimeTraceEvent::ThunkCacheBypass { .. } => summary.thunk_cache_bypasses += 1,
@@ -360,6 +365,7 @@ pub struct RuntimeTraceSummary {
     pub service_stops: usize,
     pub unhandled_effects: usize,
     pub thunk_forces: usize,
+    pub thunk_force_all: usize,
     pub thunk_cache_hits: usize,
     pub thunk_cache_stores: usize,
     pub thunk_cache_bypasses: usize,
@@ -822,6 +828,14 @@ impl<S: ObjectStore> Runtime<S> {
                 cancellation,
             )?));
         }
+        if yielded.op.as_str() == thunk::FORCE_ALL_OP {
+            return Ok(Some(self.handle_thunk_force_all_with_trace(
+                yielded,
+                host,
+                trace,
+                cancellation,
+            )?));
+        }
 
         Ok(None)
     }
@@ -835,6 +849,21 @@ impl<S: ObjectStore> Runtime<S> {
     ) -> Result<EvalResult, RuntimeError> {
         let value = self.force_thunk_args_with_trace(yielded.args, host, trace, cancellation)?;
         yielded.continuation.resume(value).map_err(Into::into)
+    }
+
+    fn handle_thunk_force_all_with_trace<H: HostHandler, T: TraceSink>(
+        &mut self,
+        yielded: Yielded,
+        host: &mut H,
+        trace: &mut T,
+        cancellation: &CancellationToken,
+    ) -> Result<EvalResult, RuntimeError> {
+        let values =
+            self.force_all_thunk_args_with_trace(yielded.args, host, trace, cancellation)?;
+        yielded
+            .continuation
+            .resume(RuntimeValue::Data(Value::List(values)))
+            .map_err(Into::into)
     }
 
     fn force_thunk_args_with_trace<H: HostHandler, T: TraceSink>(
@@ -859,6 +888,25 @@ impl<S: ObjectStore> Runtime<S> {
         }
 
         self.force_thunk_with_trace(thunk, host, trace, cancellation)
+    }
+
+    fn force_all_thunk_args_with_trace<H: HostHandler, T: TraceSink>(
+        &mut self,
+        args: Vec<RuntimeValue>,
+        host: &mut H,
+        trace: &mut T,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<Value>, RuntimeError> {
+        trace.record(RuntimeTraceEvent::ThunkForceAll { count: args.len() });
+        let mut values = Vec::with_capacity(args.len());
+        for thunk in args {
+            let value = self.force_thunk_with_trace(thunk, host, trace, cancellation)?;
+            match value {
+                RuntimeValue::Data(value) => values.push(value),
+                value => return Err(EvalError::NonDataLiteralValue(value).into()),
+            }
+        }
+        Ok(values)
     }
 
     fn force_thunk_with_trace<H: HostHandler, T: TraceSink>(

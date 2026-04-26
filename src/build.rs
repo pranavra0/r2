@@ -247,6 +247,30 @@ impl Graph {
         Ok(order)
     }
 
+    pub fn topological_layers(&self) -> Result<Vec<Vec<Handle>>, GraphError> {
+        let order = self.topological_order()?;
+        let mut depths = BTreeMap::new();
+        for handle in order {
+            let depth = self
+                .direct_dependencies(handle)?
+                .iter()
+                .map(|dependency| depths.get(dependency).copied().unwrap_or(0) + 1)
+                .max()
+                .unwrap_or(0);
+            depths.insert(handle, depth);
+        }
+
+        let mut layers = Vec::<Vec<Handle>>::new();
+        for (handle, depth) in depths {
+            if layers.len() <= depth {
+                layers.resize_with(depth + 1, Vec::new);
+            }
+            layers[depth].push(handle);
+        }
+
+        Ok(layers)
+    }
+
     pub fn to_term(&self) -> Result<Term, GraphError> {
         for handle in self.targets.values() {
             self.require_acyclic(*handle)?;
@@ -392,16 +416,33 @@ impl Graph {
     fn term_for_handle(&self, handle: Handle) -> Term {
         match &self.nodes[handle.0] {
             GraphNode::Input { artifact } => Term::Value(Value::Bytes(artifact.path().to_vec())),
+            GraphNode::Action { .. } => thunk::force(self.thunk_for_handle(handle)),
+        }
+    }
+
+    fn thunk_for_handle(&self, handle: Handle) -> Term {
+        match &self.nodes[handle.0] {
+            GraphNode::Input { artifact } => {
+                thunk::delay(Term::Value(Value::Bytes(artifact.path().to_vec())))
+            }
             GraphNode::Action {
                 action,
                 dependencies,
-            } => thunk::force(thunk::delay(sequence_terms(
-                dependencies
+            } => {
+                let dependency_thunks = dependencies
                     .iter()
-                    .map(|dependency| self.term_for_handle(*dependency))
-                    .collect(),
-                action.clone().into_term(),
-            ))),
+                    .filter_map(|dependency| match &self.nodes[dependency.0] {
+                        GraphNode::Input { .. } => None,
+                        GraphNode::Action { .. } => Some(self.thunk_for_handle(*dependency)),
+                    })
+                    .collect::<Vec<_>>();
+                let prerequisites = if dependency_thunks.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![thunk::force_all(dependency_thunks)]
+                };
+                thunk::delay(sequence_terms(prerequisites, action.clone().into_term()))
+            }
         }
     }
 }

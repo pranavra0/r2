@@ -24,6 +24,7 @@ The trace output has three parts:
 
 - `memo hit` / `memo store`: in-process memoization of closed pure terms.
 - `thunk force`: a thunk was forced.
+- `thunk force_all`: an internal batch of independent thunks was forced.
 - `thunk cache store`: a cacheable thunk result was stored.
 - `thunk cache hit`: a cached thunk result was reused.
 - `thunk cache bypass`: a thunk touched a non-cacheable effect.
