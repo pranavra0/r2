@@ -1,11 +1,13 @@
 use std::collections::BTreeMap;
 use std::fmt;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+
+use rayon::prelude::*;
 
 use crate::Canonical;
 use crate::data::{Digest, Ref, Symbol, Term, Value};
-use crate::eval::{EvalError, EvalResult, Reified, RuntimeValue, Yielded, eval};
+use crate::eval::{Continuation, EvalError, EvalResult, Reified, RuntimeValue, Yielded, eval};
 use crate::host::{
     HostEffectCaching, HostEffectPolicy, HostEffectProvenance, HostError, HostHandler,
     HostTraceEvent,
@@ -14,6 +16,7 @@ use crate::store::{CachedThunk, MemoryStore, ObjectStore, StoreError, Stored};
 use crate::thunk::{self, ThunkError};
 
 const DEFAULT_CACHE_LIMIT: usize = 10_000;
+static NEXT_TASK_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug)]
 pub enum RuntimeError {
@@ -183,7 +186,16 @@ pub enum RuntimeTraceEvent {
         key: Digest,
     },
     ThunkForceAll {
+        frontier_id: u64,
         count: usize,
+    },
+    TaskStart {
+        frontier_id: u64,
+        task_id: u64,
+    },
+    TaskEnd {
+        frontier_id: u64,
+        task_id: u64,
     },
     ThunkCacheHit {
         key: Digest,
@@ -239,7 +251,21 @@ impl fmt::Display for RuntimeTraceEvent {
             ),
             Self::UnhandledEffect { op } => write!(f, "unhandled effect: {op}"),
             Self::ThunkForce { key } => write!(f, "thunk force: {key}"),
-            Self::ThunkForceAll { count } => write!(f, "thunk force_all: {count}"),
+            Self::ThunkForceAll { frontier_id, count } => {
+                write!(f, "thunk force_all[{frontier_id}]: {count}")
+            }
+            Self::TaskStart {
+                frontier_id,
+                task_id,
+            } => {
+                write!(f, "task {task_id} start: frontier {frontier_id}")
+            }
+            Self::TaskEnd {
+                frontier_id,
+                task_id,
+            } => {
+                write!(f, "task {task_id} end: frontier {frontier_id}")
+            }
             Self::ThunkCacheHit { key } => write!(f, "thunk cache hit: {key}"),
             Self::ThunkCacheStore { key } => write!(f, "thunk cache store: {key}"),
             Self::ThunkCacheBypass {
@@ -323,6 +349,8 @@ impl RuntimeTrace {
                 RuntimeTraceEvent::UnhandledEffect { .. } => summary.unhandled_effects += 1,
                 RuntimeTraceEvent::ThunkForce { .. } => summary.thunk_forces += 1,
                 RuntimeTraceEvent::ThunkForceAll { .. } => summary.thunk_force_all += 1,
+                RuntimeTraceEvent::TaskStart { .. } => summary.task_starts += 1,
+                RuntimeTraceEvent::TaskEnd { .. } => summary.task_ends += 1,
                 RuntimeTraceEvent::ThunkCacheHit { .. } => summary.thunk_cache_hits += 1,
                 RuntimeTraceEvent::ThunkCacheStore { .. } => summary.thunk_cache_stores += 1,
                 RuntimeTraceEvent::ThunkCacheBypass { .. } => summary.thunk_cache_bypasses += 1,
@@ -366,6 +394,8 @@ pub struct RuntimeTraceSummary {
     pub unhandled_effects: usize,
     pub thunk_forces: usize,
     pub thunk_force_all: usize,
+    pub task_starts: usize,
+    pub task_ends: usize,
     pub thunk_cache_hits: usize,
     pub thunk_cache_stores: usize,
     pub thunk_cache_bypasses: usize,
@@ -398,6 +428,14 @@ impl TraceSink for RuntimeTrace {
     }
 }
 
+impl TraceSink for Arc<Mutex<RuntimeTrace>> {
+    fn record(&mut self, event: RuntimeTraceEvent) {
+        self.lock()
+            .expect("runtime trace mutex should not be poisoned")
+            .push(event);
+    }
+}
+
 #[derive(Clone, Debug)]
 struct RunOutcome {
     value: RuntimeValue,
@@ -407,8 +445,111 @@ struct RunOutcome {
 }
 
 #[derive(Clone, Debug)]
+struct ForcedThunk {
+    value: RuntimeValue,
+    cacheable: bool,
+    uncacheable_effect: Option<Symbol>,
+    uncacheable_policy: Option<HostEffectPolicy>,
+}
+
+impl ForcedThunk {
+    fn cacheable(value: RuntimeValue) -> Self {
+        Self {
+            value,
+            cacheable: true,
+            uncacheable_effect: None,
+            uncacheable_policy: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct BuiltinOutcome {
+    result: EvalResult,
+    cacheable: bool,
+    uncacheable_effect: Option<Symbol>,
+    uncacheable_policy: Option<HostEffectPolicy>,
+}
+
+#[derive(Clone, Debug)]
+struct ForceAllOutcome {
+    values: Vec<Value>,
+    cacheable: bool,
+    uncacheable_effect: Option<Symbol>,
+    uncacheable_policy: Option<HostEffectPolicy>,
+}
+
+struct BranchResult<S> {
+    result: Result<ForcedThunk, RuntimeError>,
+    trace: RuntimeTrace,
+    store: S,
+}
+
+struct SharedHost<'a> {
+    host: Arc<Mutex<&'a mut (dyn HostHandler + Send + 'a)>>,
+}
+
+impl<'a> SharedHost<'a> {
+    fn new(host: &'a mut (dyn HostHandler + Send + 'a)) -> Self {
+        Self {
+            host: Arc::new(Mutex::new(host)),
+        }
+    }
+}
+
+impl Clone for SharedHost<'_> {
+    fn clone(&self) -> Self {
+        Self {
+            host: Arc::clone(&self.host),
+        }
+    }
+}
+
+impl HostHandler for SharedHost<'_> {
+    fn handle(
+        &mut self,
+        op: &Symbol,
+        args: Vec<RuntimeValue>,
+        continuation: Continuation,
+    ) -> Result<Option<EvalResult>, HostError> {
+        let concurrent_handler = self
+            .host
+            .lock()
+            .expect("shared host mutex should not be poisoned")
+            .concurrent_handler(op);
+        if let Some(handler) = concurrent_handler {
+            return handler(args, continuation).map(Some);
+        }
+
+        self.host
+            .lock()
+            .expect("shared host mutex should not be poisoned")
+            .handle(op, args, continuation)
+    }
+
+    fn effect_policy(&self, op: &Symbol) -> HostEffectPolicy {
+        self.host
+            .lock()
+            .expect("shared host mutex should not be poisoned")
+            .effect_policy(op)
+    }
+
+    fn drain_trace_events(&mut self) -> Vec<HostTraceEvent> {
+        self.host
+            .lock()
+            .expect("shared host mutex should not be poisoned")
+            .drain_trace_events()
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct Runtime<S = MemoryStore> {
     store: S,
+    state: Arc<Mutex<RuntimeState>>,
+}
+
+#[derive(Clone, Debug)]
+struct RuntimeState {
     memo: BTreeMap<Digest, Reified>,
     thunk_cache: BTreeMap<Digest, Reified>,
     memo_order: Vec<Digest>,
@@ -433,12 +574,14 @@ impl<S> Runtime<S> {
     pub fn with_store(store: S) -> Self {
         Self {
             store,
-            memo: BTreeMap::new(),
-            thunk_cache: BTreeMap::new(),
-            memo_order: Vec::new(),
-            thunk_cache_order: Vec::new(),
-            max_memo_entries: DEFAULT_CACHE_LIMIT,
-            max_thunk_cache_entries: DEFAULT_CACHE_LIMIT,
+            state: Arc::new(Mutex::new(RuntimeState {
+                memo: BTreeMap::new(),
+                thunk_cache: BTreeMap::new(),
+                memo_order: Vec::new(),
+                thunk_cache_order: Vec::new(),
+                max_memo_entries: DEFAULT_CACHE_LIMIT,
+                max_thunk_cache_entries: DEFAULT_CACHE_LIMIT,
+            })),
         }
     }
 
@@ -451,33 +594,89 @@ impl<S> Runtime<S> {
     }
 
     pub fn memo_len(&self) -> usize {
-        self.memo.len()
+        self.state
+            .lock()
+            .expect("runtime state mutex should not be poisoned")
+            .memo
+            .len()
     }
 
     pub fn thunk_cache_len(&self) -> usize {
-        self.thunk_cache.len()
+        self.state
+            .lock()
+            .expect("runtime state mutex should not be poisoned")
+            .thunk_cache
+            .len()
     }
 
-    pub fn with_memo_limit(mut self, max_entries: usize) -> Self {
-        self.max_memo_entries = max_entries;
-        self.evict_memo_to_limit();
+    pub fn with_memo_limit(self, max_entries: usize) -> Self {
+        {
+            let mut state = self
+                .state
+                .lock()
+                .expect("runtime state mutex should not be poisoned");
+            state.max_memo_entries = max_entries;
+            state.evict_memo_to_limit();
+        }
         self
     }
 
-    pub fn with_thunk_cache_limit(mut self, max_entries: usize) -> Self {
-        self.max_thunk_cache_entries = max_entries;
-        self.evict_thunk_cache_to_limit();
+    pub fn with_thunk_cache_limit(self, max_entries: usize) -> Self {
+        {
+            let mut state = self
+                .state
+                .lock()
+                .expect("runtime state mutex should not be poisoned");
+            state.max_thunk_cache_entries = max_entries;
+            state.evict_thunk_cache_to_limit();
+        }
         self
     }
 
     pub fn max_memo_entries(&self) -> usize {
-        self.max_memo_entries
+        self.state
+            .lock()
+            .expect("runtime state mutex should not be poisoned")
+            .max_memo_entries
     }
 
     pub fn max_thunk_cache_entries(&self) -> usize {
-        self.max_thunk_cache_entries
+        self.state
+            .lock()
+            .expect("runtime state mutex should not be poisoned")
+            .max_thunk_cache_entries
     }
 
+    fn insert_memo(&mut self, digest: Digest, value: Reified) {
+        self.state
+            .lock()
+            .expect("runtime state mutex should not be poisoned")
+            .insert_memo(digest, value);
+    }
+
+    fn get_memo(&mut self, digest: &Digest) -> Option<Reified> {
+        self.state
+            .lock()
+            .expect("runtime state mutex should not be poisoned")
+            .get_memo(digest)
+    }
+
+    fn insert_thunk_cache(&mut self, digest: Digest, value: Reified) {
+        self.state
+            .lock()
+            .expect("runtime state mutex should not be poisoned")
+            .insert_thunk_cache(digest, value);
+    }
+
+    fn get_thunk_cache(&mut self, digest: &Digest) -> Option<Reified> {
+        self.state
+            .lock()
+            .expect("runtime state mutex should not be poisoned")
+            .get_thunk_cache(digest)
+    }
+}
+
+impl RuntimeState {
     fn insert_memo(&mut self, digest: Digest, value: Reified) {
         self.memo.insert(digest, value);
         touch_access_order(&mut self.memo_order, digest);
@@ -594,7 +793,7 @@ impl<S: ObjectStore> Runtime<S> {
         }
     }
 
-    pub fn run<H: HostHandler>(
+    pub fn run<H: HostHandler + Send>(
         &mut self,
         term: Term,
         host: &mut H,
@@ -603,7 +802,7 @@ impl<S: ObjectStore> Runtime<S> {
         self.run_with_cancellation(term, host, &token)
     }
 
-    pub fn run_with_cancellation<H: HostHandler>(
+    pub fn run_with_cancellation<H: HostHandler + Send>(
         &mut self,
         term: Term,
         host: &mut H,
@@ -615,7 +814,7 @@ impl<S: ObjectStore> Runtime<S> {
             .value)
     }
 
-    pub fn run_with_trace<H: HostHandler>(
+    pub fn run_with_trace<H: HostHandler + Send>(
         &mut self,
         term: Term,
         host: &mut H,
@@ -624,7 +823,7 @@ impl<S: ObjectStore> Runtime<S> {
         self.run_with_trace_and_cancellation(term, host, &token)
     }
 
-    pub fn run_with_trace_and_cancellation<H: HostHandler>(
+    pub fn run_with_trace_and_cancellation<H: HostHandler + Send>(
         &mut self,
         term: Term,
         host: &mut H,
@@ -637,7 +836,7 @@ impl<S: ObjectStore> Runtime<S> {
         Ok(TracedRun { value, trace })
     }
 
-    pub fn run_ref<H: HostHandler>(
+    pub fn run_ref<H: HostHandler + Send>(
         &mut self,
         reference: &Ref,
         host: &mut H,
@@ -646,7 +845,7 @@ impl<S: ObjectStore> Runtime<S> {
         self.run_ref_with_cancellation(reference, host, &token)
     }
 
-    pub fn run_ref_with_cancellation<H: HostHandler>(
+    pub fn run_ref_with_cancellation<H: HostHandler + Send>(
         &mut self,
         reference: &Ref,
         host: &mut H,
@@ -658,7 +857,7 @@ impl<S: ObjectStore> Runtime<S> {
             .value)
     }
 
-    pub fn run_ref_with_trace<H: HostHandler>(
+    pub fn run_ref_with_trace<H: HostHandler + Send>(
         &mut self,
         reference: &Ref,
         host: &mut H,
@@ -667,7 +866,7 @@ impl<S: ObjectStore> Runtime<S> {
         self.run_ref_with_trace_and_cancellation(reference, host, &token)
     }
 
-    pub fn run_ref_with_trace_and_cancellation<H: HostHandler>(
+    pub fn run_ref_with_trace_and_cancellation<H: HostHandler + Send>(
         &mut self,
         reference: &Ref,
         host: &mut H,
@@ -725,7 +924,7 @@ impl<S: ObjectStore> Runtime<S> {
         Ok(stored)
     }
 
-    fn run_with_trace_sink<H: HostHandler, T: TraceSink>(
+    fn run_with_trace_sink<H: HostHandler + Send, T: TraceSink>(
         &mut self,
         term: Term,
         host: &mut H,
@@ -737,7 +936,7 @@ impl<S: ObjectStore> Runtime<S> {
         self.drive_with_trace(result, host, trace, cancellation)
     }
 
-    fn run_ref_with_trace_sink<H: HostHandler, T: TraceSink>(
+    fn run_ref_with_trace_sink<H: HostHandler + Send, T: TraceSink>(
         &mut self,
         reference: &Ref,
         host: &mut H,
@@ -749,7 +948,7 @@ impl<S: ObjectStore> Runtime<S> {
         self.drive_with_trace(result, host, trace, cancellation)
     }
 
-    fn drive_with_trace<H: HostHandler, T: TraceSink>(
+    fn drive_with_trace<H: HostHandler + Send, T: TraceSink>(
         &mut self,
         mut result: EvalResult,
         host: &mut H,
@@ -778,11 +977,18 @@ impl<S: ObjectStore> Runtime<S> {
                     trace.record(RuntimeTraceEvent::Yield {
                         op: yielded.op.clone(),
                     });
-                    if let Some(next) =
+                    if let Some(builtin) =
                         self.handle_builtin_with_trace(yielded.clone(), host, trace, cancellation)?
                     {
+                        if !builtin.cacheable {
+                            cacheable = false;
+                            if uncacheable_effect.is_none() {
+                                uncacheable_effect = builtin.uncacheable_effect;
+                                uncacheable_policy = builtin.uncacheable_policy;
+                            }
+                        }
                         trace.record(RuntimeTraceEvent::BuiltinHandle { op: yielded.op });
-                        result = next;
+                        result = builtin.result;
                     } else if let Some(next) =
                         host.handle(&yielded.op, yielded.args, yielded.continuation)?
                     {
@@ -813,13 +1019,13 @@ impl<S: ObjectStore> Runtime<S> {
         }
     }
 
-    fn handle_builtin_with_trace<H: HostHandler, T: TraceSink>(
+    fn handle_builtin_with_trace<H: HostHandler + Send, T: TraceSink>(
         &mut self,
         yielded: Yielded,
         host: &mut H,
         trace: &mut T,
         cancellation: &CancellationToken,
-    ) -> Result<Option<EvalResult>, RuntimeError> {
+    ) -> Result<Option<BuiltinOutcome>, RuntimeError> {
         if yielded.op.as_str() == thunk::FORCE_OP {
             return Ok(Some(self.handle_thunk_force_with_trace(
                 yielded,
@@ -840,39 +1046,54 @@ impl<S: ObjectStore> Runtime<S> {
         Ok(None)
     }
 
-    fn handle_thunk_force_with_trace<H: HostHandler, T: TraceSink>(
+    fn handle_thunk_force_with_trace<H: HostHandler + Send, T: TraceSink>(
         &mut self,
         yielded: Yielded,
         host: &mut H,
         trace: &mut T,
         cancellation: &CancellationToken,
-    ) -> Result<EvalResult, RuntimeError> {
-        let value = self.force_thunk_args_with_trace(yielded.args, host, trace, cancellation)?;
-        yielded.continuation.resume(value).map_err(Into::into)
+    ) -> Result<BuiltinOutcome, RuntimeError> {
+        let forced = self.force_thunk_args_with_trace(yielded.args, host, trace, cancellation)?;
+        let result = yielded
+            .continuation
+            .resume(forced.value)
+            .map_err(RuntimeError::from)?;
+        Ok(BuiltinOutcome {
+            result,
+            cacheable: forced.cacheable,
+            uncacheable_effect: forced.uncacheable_effect,
+            uncacheable_policy: forced.uncacheable_policy,
+        })
     }
 
-    fn handle_thunk_force_all_with_trace<H: HostHandler, T: TraceSink>(
+    fn handle_thunk_force_all_with_trace<H: HostHandler + Send, T: TraceSink>(
         &mut self,
         yielded: Yielded,
         host: &mut H,
         trace: &mut T,
         cancellation: &CancellationToken,
-    ) -> Result<EvalResult, RuntimeError> {
+    ) -> Result<BuiltinOutcome, RuntimeError> {
         let values =
             self.force_all_thunk_args_with_trace(yielded.args, host, trace, cancellation)?;
-        yielded
+        let result = yielded
             .continuation
-            .resume(RuntimeValue::Data(Value::List(values)))
-            .map_err(Into::into)
+            .resume(RuntimeValue::Data(Value::List(values.values)))
+            .map_err(RuntimeError::from)?;
+        Ok(BuiltinOutcome {
+            result,
+            cacheable: values.cacheable,
+            uncacheable_effect: values.uncacheable_effect,
+            uncacheable_policy: values.uncacheable_policy,
+        })
     }
 
-    fn force_thunk_args_with_trace<H: HostHandler, T: TraceSink>(
+    fn force_thunk_args_with_trace<H: HostHandler + Send, T: TraceSink>(
         &mut self,
         args: Vec<RuntimeValue>,
         host: &mut H,
         trace: &mut T,
         cancellation: &CancellationToken,
-    ) -> Result<RuntimeValue, RuntimeError> {
+    ) -> Result<ForcedThunk, RuntimeError> {
         let mut args = args.into_iter();
         let thunk = args.next().ok_or(ThunkError::WrongArgumentCount {
             expected: 1,
@@ -890,45 +1111,150 @@ impl<S: ObjectStore> Runtime<S> {
         self.force_thunk_with_trace(thunk, host, trace, cancellation)
     }
 
-    fn force_all_thunk_args_with_trace<H: HostHandler, T: TraceSink>(
+    fn force_all_thunk_args_with_trace<H: HostHandler + Send, T: TraceSink>(
         &mut self,
         args: Vec<RuntimeValue>,
         host: &mut H,
         trace: &mut T,
         cancellation: &CancellationToken,
-    ) -> Result<Vec<Value>, RuntimeError> {
-        trace.record(RuntimeTraceEvent::ThunkForceAll { count: args.len() });
-        let mut values = Vec::with_capacity(args.len());
-        for thunk in args {
-            let value = self.force_thunk_with_trace(thunk, host, trace, cancellation)?;
-            match value {
+    ) -> Result<ForceAllOutcome, RuntimeError> {
+        let frontier_id = NEXT_TASK_ID.fetch_add(1, Ordering::Relaxed);
+        trace.record(RuntimeTraceEvent::ThunkForceAll {
+            frontier_id,
+            count: args.len(),
+        });
+
+        let thunks = args
+            .iter()
+            .map(reified_thunk_term)
+            .collect::<Result<Vec<_>, _>>()?;
+        if thunks.len() <= 1 {
+            let mut values = Vec::with_capacity(thunks.len());
+            let mut cacheable = true;
+            let mut uncacheable_effect = None;
+            let mut uncacheable_policy = None;
+            for (key, term) in thunks {
+                let forced =
+                    self.force_reified_thunk_with_trace(key, term, host, trace, cancellation)?;
+                if !forced.cacheable {
+                    cacheable = false;
+                    if uncacheable_effect.is_none() {
+                        uncacheable_effect = forced.uncacheable_effect.clone();
+                        uncacheable_policy = forced.uncacheable_policy;
+                    }
+                }
+                match forced.value {
+                    RuntimeValue::Data(value) => values.push(value),
+                    value => return Err(EvalError::NonDataLiteralValue(value).into()),
+                }
+            }
+            return Ok(ForceAllOutcome {
+                values,
+                cacheable,
+                uncacheable_effect,
+                uncacheable_policy,
+            });
+        }
+
+        let shared_host = SharedHost::new(host);
+        let state = Arc::clone(&self.state);
+        let store = self.store.clone();
+        let mut branch_results = thunks
+            .into_par_iter()
+            .map(|(key, term)| {
+                let task_id = NEXT_TASK_ID.fetch_add(1, Ordering::Relaxed);
+                let mut branch_trace = RuntimeTrace::default();
+                branch_trace.push(RuntimeTraceEvent::TaskStart {
+                    frontier_id,
+                    task_id,
+                });
+                let mut branch_runtime = Runtime {
+                    store: store.clone(),
+                    state: Arc::clone(&state),
+                };
+                let mut branch_host = shared_host.clone();
+                let result = branch_runtime.force_reified_thunk_with_trace(
+                    key,
+                    term,
+                    &mut branch_host,
+                    &mut branch_trace,
+                    cancellation,
+                );
+                branch_trace.push(RuntimeTraceEvent::TaskEnd {
+                    frontier_id,
+                    task_id,
+                });
+                BranchResult {
+                    result,
+                    trace: branch_trace,
+                    store: branch_runtime.store,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let mut values = Vec::with_capacity(branch_results.len());
+        let mut cacheable = true;
+        let mut uncacheable_effect = None;
+        let mut uncacheable_policy = None;
+        for branch in branch_results.drain(..) {
+            self.store.merge_from(branch.store)?;
+            for event in branch.trace.events {
+                trace.record(event);
+            }
+            let forced = branch.result?;
+            if !forced.cacheable {
+                cacheable = false;
+                if uncacheable_effect.is_none() {
+                    uncacheable_effect = forced.uncacheable_effect.clone();
+                    uncacheable_policy = forced.uncacheable_policy;
+                }
+            }
+            match forced.value {
                 RuntimeValue::Data(value) => values.push(value),
                 value => return Err(EvalError::NonDataLiteralValue(value).into()),
             }
         }
-        Ok(values)
+
+        Ok(ForceAllOutcome {
+            values,
+            cacheable,
+            uncacheable_effect,
+            uncacheable_policy,
+        })
     }
 
-    fn force_thunk_with_trace<H: HostHandler, T: TraceSink>(
+    fn force_thunk_with_trace<H: HostHandler + Send, T: TraceSink>(
         &mut self,
         thunk_value: RuntimeValue,
         host: &mut H,
         trace: &mut T,
         cancellation: &CancellationToken,
-    ) -> Result<RuntimeValue, RuntimeError> {
+    ) -> Result<ForcedThunk, RuntimeError> {
         cancellation.check()?;
         let (key, term) = reified_thunk_term(&thunk_value)?;
+        self.force_reified_thunk_with_trace(key, term, host, trace, cancellation)
+    }
+
+    fn force_reified_thunk_with_trace<H: HostHandler + Send, T: TraceSink>(
+        &mut self,
+        key: Digest,
+        term: Term,
+        host: &mut H,
+        trace: &mut T,
+        cancellation: &CancellationToken,
+    ) -> Result<ForcedThunk, RuntimeError> {
+        cancellation.check()?;
         trace.record(RuntimeTraceEvent::ThunkForce { key });
 
         if let Some(reified) = self.get_thunk_cache(&key) {
             trace.record(RuntimeTraceEvent::ThunkCacheHit { key });
-            return Ok(reified.into_runtime());
+            return Ok(ForcedThunk::cacheable(reified.into_runtime()));
         }
 
         if let Some(reified) = self.load_cached_thunk_with_trace(&key, trace)? {
             self.insert_thunk_cache(key, reified.clone());
             trace.record(RuntimeTraceEvent::ThunkCacheHit { key });
-            return Ok(reified.into_runtime());
+            return Ok(ForcedThunk::cacheable(reified.into_runtime()));
         }
 
         let outcome = self.run_with_trace_sink(term, host, trace, cancellation)?;
@@ -936,10 +1262,15 @@ impl<S: ObjectStore> Runtime<S> {
         if !outcome.cacheable {
             trace.record(RuntimeTraceEvent::ThunkCacheBypass {
                 key,
-                op: outcome.uncacheable_effect,
+                op: outcome.uncacheable_effect.clone(),
                 policy: outcome.uncacheable_policy,
             });
-            return Ok(outcome.value);
+            return Ok(ForcedThunk {
+                value: outcome.value,
+                cacheable: false,
+                uncacheable_effect: outcome.uncacheable_effect,
+                uncacheable_policy: outcome.uncacheable_policy,
+            });
         }
 
         let reified = outcome
@@ -951,7 +1282,7 @@ impl<S: ObjectStore> Runtime<S> {
         self.persist_reified_with_trace(key, &reified, trace)?;
         self.insert_thunk_cache(key, reified.clone());
         trace.record(RuntimeTraceEvent::ThunkCacheStore { key });
-        Ok(reified.into_runtime())
+        Ok(ForcedThunk::cacheable(reified.into_runtime()))
     }
 
     fn load_cached_thunk_with_trace<T: TraceSink>(
@@ -1062,19 +1393,18 @@ fn touch_access_order(order: &mut Vec<Digest>, digest: Digest) {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
-    use std::rc::Rc;
+    use std::sync::{Arc, Mutex};
 
     use super::*;
     use crate::host::{Host, HostEffectPolicy};
 
-    fn counting_host(counter: Rc<RefCell<usize>>) -> Host {
+    fn counting_host(counter: Arc<Mutex<usize>>) -> Host {
         let mut host = Host::new();
         host.register_with_policy(
             "count.tick",
             HostEffectPolicy::stable(),
             move |_args, continuation| {
-                let mut value = counter.borrow_mut();
+                let mut value = counter.lock().expect("counter should not be poisoned");
                 *value += 1;
                 continuation
                     .resume(RuntimeValue::Data(Value::Integer(1)))
@@ -1177,7 +1507,7 @@ mod tests {
 
     #[test]
     fn thunk_force_computes_once_and_then_uses_cache() {
-        let counter = Rc::new(RefCell::new(0));
+        let counter = Arc::new(Mutex::new(0));
         let mut host = counting_host(counter.clone());
         let mut runtime = Runtime::new();
         let thunk = thunk::delay(Term::Perform {
@@ -1201,13 +1531,13 @@ mod tests {
             RuntimeValue::Data(Value::Integer(value)) => assert_eq!(value, 1),
             other => panic!("unexpected result: {other:?}"),
         }
-        assert_eq!(*counter.borrow(), 1);
+        assert_eq!(*counter.lock().expect("counter should not be poisoned"), 1);
         assert_eq!(runtime.thunk_cache_len(), 1);
     }
 
     #[test]
     fn nested_thunks_share_their_inner_cache() {
-        let counter = Rc::new(RefCell::new(0));
+        let counter = Arc::new(Mutex::new(0));
         let mut host = counting_host(counter.clone());
         let mut runtime = Runtime::new();
         let program = thunk::force(thunk::delay(Term::Apply {
@@ -1230,18 +1560,171 @@ mod tests {
             RuntimeValue::Data(Value::Integer(value)) => assert_eq!(value, 1),
             other => panic!("unexpected result: {other:?}"),
         }
-        assert_eq!(*counter.borrow(), 1);
+        assert_eq!(*counter.lock().expect("counter should not be poisoned"), 1);
         assert_eq!(runtime.thunk_cache_len(), 2);
     }
 
     #[test]
+    fn force_all_records_tasks_and_preserves_result_order() {
+        let mut runtime = Runtime::new();
+        let mut host = Host::new();
+        let program = thunk::force_all([
+            thunk::delay(Term::Value(Value::Integer(1))),
+            thunk::delay(Term::Value(Value::Integer(2))),
+            thunk::delay(Term::Value(Value::Integer(3))),
+        ]);
+
+        let traced = runtime
+            .run_with_trace(program, &mut host)
+            .expect("force_all should run");
+
+        assert_eq!(
+            traced.value.as_data(),
+            Some(&Value::List(vec![
+                Value::Integer(1),
+                Value::Integer(2),
+                Value::Integer(3),
+            ]))
+        );
+        let summary = traced.trace.summary();
+        assert_eq!(summary.thunk_force_all, 1);
+        assert_eq!(summary.task_starts, 3);
+        assert_eq!(summary.task_ends, 3);
+    }
+
+    #[test]
+    fn force_all_reuses_shared_thunk_cache_after_first_batch() {
+        let counter = Arc::new(Mutex::new(0));
+        let mut host = counting_host(counter.clone());
+        let mut runtime = Runtime::new();
+        let program = thunk::force_all([
+            thunk::delay(Term::Perform {
+                op: Symbol::from("count.tick"),
+                args: vec![Term::Value(Value::Integer(1))],
+            }),
+            thunk::delay(Term::Perform {
+                op: Symbol::from("count.tick"),
+                args: vec![Term::Value(Value::Integer(2))],
+            }),
+        ]);
+
+        let first = runtime
+            .run_with_trace(program.clone(), &mut host)
+            .expect("first force_all should run");
+        let second = runtime
+            .run_with_trace(program, &mut host)
+            .expect("second force_all should run");
+
+        assert_eq!(
+            first.value.as_data(),
+            Some(&Value::List(vec![Value::Integer(1), Value::Integer(1)]))
+        );
+        assert_eq!(
+            second.value.as_data(),
+            Some(&Value::List(vec![Value::Integer(1), Value::Integer(1)]))
+        );
+        assert_eq!(*counter.lock().expect("counter should not be poisoned"), 2);
+        assert!(second.trace.summary().thunk_cache_hits >= 2);
+    }
+
+    #[test]
+    fn force_all_keeps_volatile_branches_out_of_thunk_cache() {
+        let counter = Arc::new(Mutex::new(0));
+        let mut host = Host::new();
+        host.register("count.tick", {
+            let counter = counter.clone();
+            move |args, continuation| {
+                let mut value = counter.lock().expect("counter should not be poisoned");
+                *value += 1;
+                let result = args
+                    .first()
+                    .and_then(RuntimeValue::as_data)
+                    .cloned()
+                    .unwrap_or(Value::Integer(i64::from(*value)));
+                continuation
+                    .resume(RuntimeValue::Data(result))
+                    .map_err(Into::into)
+            }
+        });
+        let mut runtime = Runtime::new();
+        let program = thunk::force_all([
+            thunk::delay(Term::Perform {
+                op: Symbol::from("count.tick"),
+                args: vec![Term::Value(Value::Integer(1))],
+            }),
+            thunk::delay(Term::Perform {
+                op: Symbol::from("count.tick"),
+                args: vec![Term::Value(Value::Integer(2))],
+            }),
+        ]);
+
+        let traced = runtime
+            .run_with_trace(program, &mut host)
+            .expect("force_all should run");
+
+        assert_eq!(
+            traced.value.as_data(),
+            Some(&Value::List(vec![Value::Integer(1), Value::Integer(2)]))
+        );
+        assert_eq!(*counter.lock().expect("counter should not be poisoned"), 2);
+        assert_eq!(runtime.thunk_cache_len(), 0);
+        assert_eq!(traced.trace.summary().thunk_cache_bypasses, 4);
+    }
+
+    #[test]
+    fn force_all_propagates_branch_cancellation() {
+        let cancellation = CancellationToken::new();
+        let handler_token = cancellation.clone();
+        let mut host = Host::new();
+        host.register("cancel.now", move |_args, continuation| {
+            handler_token.cancel();
+            continuation
+                .resume(RuntimeValue::Data(Value::Symbol(Symbol::from("cancelled"))))
+                .map_err(Into::into)
+        });
+        let mut runtime = Runtime::new();
+        let program = thunk::force_all([
+            thunk::delay(Term::Perform {
+                op: Symbol::from("cancel.now"),
+                args: Vec::new(),
+            }),
+            thunk::delay(Term::Value(Value::Integer(1))),
+        ]);
+
+        let error = runtime
+            .run_with_cancellation(program, &mut host, &cancellation)
+            .expect_err("cancelled force_all should fail");
+
+        assert!(matches!(error, RuntimeError::Cancelled));
+    }
+
+    #[test]
+    fn force_all_rejects_non_data_branch_results() {
+        let mut runtime = Runtime::new();
+        let mut host = Host::new();
+        let program = thunk::force_all([
+            thunk::delay(Term::Value(Value::Integer(1))),
+            thunk::delay(Term::lambda(1, Term::var(0))),
+        ]);
+
+        let error = runtime
+            .run(program, &mut host)
+            .expect_err("force_all should reject closure results");
+
+        assert!(matches!(
+            error,
+            RuntimeError::Eval(EvalError::NonDataLiteralValue(_))
+        ));
+    }
+
+    #[test]
     fn volatile_host_effects_do_not_enter_thunk_cache() {
-        let counter = Rc::new(RefCell::new(0));
+        let counter = Arc::new(Mutex::new(0));
         let mut host = Host::new();
         host.register("count.tick", {
             let counter = counter.clone();
             move |_args, continuation| {
-                let mut value = counter.borrow_mut();
+                let mut value = counter.lock().expect("counter should not be poisoned");
                 *value += 1;
                 continuation
                     .resume(RuntimeValue::Data(Value::Integer(i64::from(*value))))
@@ -1271,13 +1754,13 @@ mod tests {
             RuntimeValue::Data(Value::Integer(value)) => assert_eq!(value, 2),
             other => panic!("unexpected result: {other:?}"),
         }
-        assert_eq!(*counter.borrow(), 2);
+        assert_eq!(*counter.lock().expect("counter should not be poisoned"), 2);
         assert_eq!(runtime.thunk_cache_len(), 0);
     }
 
     #[test]
     fn traced_runs_record_thunk_and_host_activity() {
-        let counter = Rc::new(RefCell::new(0));
+        let counter = Arc::new(Mutex::new(0));
         let mut host = counting_host(counter.clone());
         let mut runtime = Runtime::new();
         let thunk = thunk::delay(Term::Perform {
@@ -1303,7 +1786,7 @@ mod tests {
             RuntimeValue::Data(Value::Integer(value)) => assert_eq!(value, 1),
             other => panic!("unexpected result: {other:?}"),
         }
-        assert_eq!(*counter.borrow(), 1);
+        assert_eq!(*counter.lock().expect("counter should not be poisoned"), 1);
         assert!(
             traced
                 .trace
@@ -1327,12 +1810,12 @@ mod tests {
 
     #[test]
     fn traced_runs_record_volatile_thunk_cache_bypass() {
-        let counter = Rc::new(RefCell::new(0));
+        let counter = Arc::new(Mutex::new(0));
         let mut host = Host::new();
         host.register("count.tick", {
             let counter = counter.clone();
             move |_args, continuation| {
-                let mut value = counter.borrow_mut();
+                let mut value = counter.lock().expect("counter should not be poisoned");
                 *value += 1;
                 continuation
                     .resume(RuntimeValue::Data(Value::Integer(1)))
@@ -1363,7 +1846,7 @@ mod tests {
             RuntimeValue::Data(Value::Integer(value)) => assert_eq!(value, 1),
             other => panic!("unexpected result: {other:?}"),
         }
-        assert_eq!(*counter.borrow(), 2);
+        assert_eq!(*counter.lock().expect("counter should not be poisoned"), 2);
         assert!(traced.trace.events().iter().any(|event| matches!(
             event,
             RuntimeTraceEvent::ThunkCacheBypass {
@@ -1376,7 +1859,7 @@ mod tests {
 
     #[test]
     fn trace_summary_counts_boundary_activity() {
-        let counter = Rc::new(RefCell::new(0));
+        let counter = Arc::new(Mutex::new(0));
         let mut host = counting_host(counter);
         let mut runtime = Runtime::new();
         let thunk = thunk::delay(Term::Perform {

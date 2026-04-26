@@ -317,6 +317,10 @@ fn print_trace_summary(summary: &RuntimeTraceSummary) {
         summary.thunk_forces, summary.thunk_force_all
     );
     println!(
+        "- tasks: starts {}, ends {}",
+        summary.task_starts, summary.task_ends
+    );
+    println!(
         "- thunk cache: hits {}, stores {}, bypasses {}",
         summary.thunk_cache_hits, summary.thunk_cache_stores, summary.thunk_cache_bypasses
     );

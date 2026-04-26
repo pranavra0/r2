@@ -167,6 +167,85 @@ fn independent_slow_graph_actions_capture_current_sequential_baseline() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+#[test]
+fn dependent_slow_graph_frontier_runs_in_parallel() {
+    let Some(shell) = command_path("sh") else {
+        eprintln!("skipping slow graph frontier because no sh was found");
+        return;
+    };
+
+    let root = unique_temp_dir("r2-build-graph-frontier");
+    std::fs::create_dir_all(&root).expect("temp dir should create");
+    let mut graph = BuildGraph::new();
+    let mut outputs = Vec::new();
+
+    for index in 0..4 {
+        let output = root.join(format!("out-{index}.txt"));
+        outputs.push(output.clone());
+        graph.action(
+            BuildAction::new(vec![
+                path_bytes(&shell),
+                b"-c".to_vec(),
+                b"sleep 0.2; printf ok > \"$1\"".to_vec(),
+                b"sh".to_vec(),
+                path_bytes(&output),
+            ])
+            .inherit_env()
+            .output(BuildArtifact::new(path_bytes(&output))),
+        );
+    }
+
+    let combined = root.join("combined.txt");
+    let mut combine = BuildAction::new(vec![
+        path_bytes(&shell),
+        b"-c".to_vec(),
+        b"cat \"$1\" \"$2\" \"$3\" \"$4\" > \"$5\"".to_vec(),
+        b"sh".to_vec(),
+        path_bytes(&outputs[0]),
+        path_bytes(&outputs[1]),
+        path_bytes(&outputs[2]),
+        path_bytes(&outputs[3]),
+        path_bytes(&combined),
+    ])
+    .inherit_env()
+    .output(BuildArtifact::new(path_bytes(&combined)));
+    for output in &outputs {
+        combine = combine.input(BuildArtifact::new(path_bytes(output)));
+    }
+    let combined_handle = graph.action(combine);
+    graph
+        .target("combined", combined_handle)
+        .expect("target should register");
+
+    let mut runtime = Runtime::new();
+    let mut host = Host::new();
+    host.install_hermetic_process_spawn();
+    let started = Instant::now();
+    let traced = runtime
+        .run_with_trace(graph.to_term().expect("graph should lower"), &mut host)
+        .expect("graph term should run");
+    let elapsed = started.elapsed();
+
+    let RuntimeValue::Data(Value::Record(targets)) = traced.value else {
+        panic!("unexpected graph result");
+    };
+    assert_eq!(targets.len(), 1);
+    assert!(
+        elapsed < Duration::from_millis(750),
+        "dependency frontier should run below serial wall time; elapsed {elapsed:?}"
+    );
+    let summary = traced.trace.summary();
+    assert_eq!(summary.thunk_force_all, 1);
+    assert_eq!(summary.task_starts, 4);
+    assert_eq!(summary.task_ends, 4);
+    assert_eq!(
+        std::fs::read_to_string(&combined).expect("combined output should exist"),
+        "okokokok"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
 fn write_sources(root: &Path) {
     std::fs::write(
         root.join("main.c"),

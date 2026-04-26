@@ -1,7 +1,6 @@
-use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fmt;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use crate::{CaseBranch, Lambda, Pattern, RecBinding, Ref, Symbol, Term, Value, VarIndex};
 
@@ -85,13 +84,13 @@ impl fmt::Debug for Closure {
 
 #[derive(Clone)]
 pub struct RecursiveClosure {
-    bindings: Rc<Vec<RecBinding>>,
+    bindings: Arc<Vec<RecBinding>>,
     index: usize,
     env: Env,
 }
 
 impl RecursiveClosure {
-    fn new(bindings: Rc<Vec<RecBinding>>, index: usize, env: Env) -> Self {
+    fn new(bindings: Arc<Vec<RecBinding>>, index: usize, env: Env) -> Self {
         Self {
             bindings,
             index,
@@ -112,13 +111,13 @@ impl fmt::Debug for RecursiveClosure {
 
 #[derive(Clone)]
 pub struct Continuation {
-    state: Rc<RefCell<Option<CapturedContinuation>>>,
+    state: Arc<Mutex<Option<CapturedContinuation>>>,
 }
 
 impl Continuation {
     fn new(scopes: Vec<Scope>) -> Self {
         Self {
-            state: Rc::new(RefCell::new(Some(CapturedContinuation { scopes }))),
+            state: Arc::new(Mutex::new(Some(CapturedContinuation { scopes }))),
         }
     }
 
@@ -129,7 +128,8 @@ impl Continuation {
 
     fn take(&self) -> Result<CapturedContinuation, EvalError> {
         self.state
-            .borrow_mut()
+            .lock()
+            .expect("continuation mutex should not be poisoned")
             .take()
             .ok_or(EvalError::ContinuationAlreadyResumed)
     }
@@ -137,7 +137,12 @@ impl Continuation {
 
 impl fmt::Debug for Continuation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let state = if self.state.borrow().is_some() {
+        let state = if self
+            .state
+            .lock()
+            .expect("continuation mutex should not be poisoned")
+            .is_some()
+        {
             "fresh"
         } else {
             "consumed"
@@ -412,7 +417,7 @@ impl Machine {
                 self.control = Control::Value(RuntimeValue::Ref(reference));
             }
             Term::Rec { bindings, body } => {
-                let bindings = Rc::new(bindings);
+                let bindings = Arc::new(bindings);
                 let mut rec_env = env.clone();
                 rec_env.extend((0..bindings.len()).map(|index| {
                     RuntimeValue::RecursiveClosure(RecursiveClosure::new(

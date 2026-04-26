@@ -1,11 +1,10 @@
-use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::io::Write;
 use std::io::{self, ErrorKind};
 use std::path::PathBuf;
 use std::process::{Command, ExitStatus, Stdio};
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -15,9 +14,11 @@ use crate::{
     Symbol, Value,
 };
 
-type Handler = dyn FnMut(Vec<RuntimeValue>, Continuation) -> Result<EvalResult, HostError>;
-type ProcessCache = Rc<RefCell<BTreeMap<Digest, Value>>>;
-type HostTraceEvents = Rc<RefCell<Vec<HostTraceEvent>>>;
+type Handler = dyn FnMut(Vec<RuntimeValue>, Continuation) -> Result<EvalResult, HostError> + Send;
+pub type ConcurrentHandler =
+    dyn Fn(Vec<RuntimeValue>, Continuation) -> Result<EvalResult, HostError> + Send + Sync;
+type ProcessCache = Arc<Mutex<BTreeMap<Digest, Value>>>;
+type HostTraceEvents = Arc<Mutex<Vec<HostTraceEvent>>>;
 
 const FS_READ_OP: &str = "fs.read";
 const FS_WRITE_OP: &str = "fs.write";
@@ -141,6 +142,10 @@ pub trait HostHandler {
         HostEffectPolicy::volatile()
     }
 
+    fn concurrent_handler(&self, _op: &Symbol) -> Option<Arc<ConcurrentHandler>> {
+        None
+    }
+
     fn drain_trace_events(&mut self) -> Vec<HostTraceEvent> {
         Vec::new()
     }
@@ -148,6 +153,7 @@ pub trait HostHandler {
 
 struct RegisteredHandler {
     handler: Box<Handler>,
+    concurrent_handler: Option<Arc<ConcurrentHandler>>,
     policy: HostEffectPolicy,
 }
 
@@ -216,7 +222,7 @@ impl Host {
     pub fn new() -> Self {
         Self {
             handlers: BTreeMap::new(),
-            trace_events: Rc::new(RefCell::new(Vec::new())),
+            trace_events: Arc::new(Mutex::new(Vec::new())),
             cancellation: CancellationToken::new(),
         }
     }
@@ -224,35 +230,35 @@ impl Host {
     pub fn with_cancellation(cancellation: CancellationToken) -> Self {
         Self {
             handlers: BTreeMap::new(),
-            trace_events: Rc::new(RefCell::new(Vec::new())),
+            trace_events: Arc::new(Mutex::new(Vec::new())),
             cancellation,
         }
     }
 
     pub fn register<F>(&mut self, op: impl Into<Symbol>, handler: F)
     where
-        F: FnMut(Vec<RuntimeValue>, Continuation) -> Result<EvalResult, HostError> + 'static,
+        F: FnMut(Vec<RuntimeValue>, Continuation) -> Result<EvalResult, HostError> + Send + 'static,
     {
         self.register_with_policy(op, HostEffectPolicy::volatile(), handler);
     }
 
     pub fn register_stable<F>(&mut self, op: impl Into<Symbol>, handler: F)
     where
-        F: FnMut(Vec<RuntimeValue>, Continuation) -> Result<EvalResult, HostError> + 'static,
+        F: FnMut(Vec<RuntimeValue>, Continuation) -> Result<EvalResult, HostError> + Send + 'static,
     {
         self.register_with_policy(op, HostEffectPolicy::stable(), handler);
     }
 
     pub fn register_declared<F>(&mut self, op: impl Into<Symbol>, handler: F)
     where
-        F: FnMut(Vec<RuntimeValue>, Continuation) -> Result<EvalResult, HostError> + 'static,
+        F: FnMut(Vec<RuntimeValue>, Continuation) -> Result<EvalResult, HostError> + Send + 'static,
     {
         self.register_with_policy(op, HostEffectPolicy::declared(), handler);
     }
 
     pub fn register_hermetic<F>(&mut self, op: impl Into<Symbol>, handler: F)
     where
-        F: FnMut(Vec<RuntimeValue>, Continuation) -> Result<EvalResult, HostError> + 'static,
+        F: FnMut(Vec<RuntimeValue>, Continuation) -> Result<EvalResult, HostError> + Send + 'static,
     {
         self.register_with_policy(op, HostEffectPolicy::hermetic(), handler);
     }
@@ -263,12 +269,38 @@ impl Host {
         policy: HostEffectPolicy,
         handler: F,
     ) where
-        F: FnMut(Vec<RuntimeValue>, Continuation) -> Result<EvalResult, HostError> + 'static,
+        F: FnMut(Vec<RuntimeValue>, Continuation) -> Result<EvalResult, HostError> + Send + 'static,
     {
         self.handlers.insert(
             op.into(),
             RegisteredHandler {
                 handler: Box::new(handler),
+                concurrent_handler: None,
+                policy,
+            },
+        );
+    }
+
+    pub fn register_concurrent_with_policy<F>(
+        &mut self,
+        op: impl Into<Symbol>,
+        policy: HostEffectPolicy,
+        handler: F,
+    ) where
+        F: Fn(Vec<RuntimeValue>, Continuation) -> Result<EvalResult, HostError>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let handler = Arc::new(handler);
+        self.handlers.insert(
+            op.into(),
+            RegisteredHandler {
+                handler: Box::new({
+                    let handler = Arc::clone(&handler);
+                    move |args, continuation| handler(args, continuation)
+                }),
+                concurrent_handler: Some(handler),
                 policy,
             },
         );
@@ -287,18 +319,27 @@ impl Host {
     }
 
     pub fn install_hermetic_process_spawn(&mut self) {
-        let cache = Rc::new(RefCell::new(BTreeMap::new()));
+        let cache = Arc::new(Mutex::new(BTreeMap::new()));
         let cancellation = self.cancellation.clone();
-        self.register_hermetic(PROCESS_SPAWN_OP, move |args, continuation| {
-            hermetic_process_spawn_handler(args, continuation, Rc::clone(&cache), &cancellation)
-        });
+        self.register_concurrent_with_policy(
+            PROCESS_SPAWN_OP,
+            HostEffectPolicy::hermetic(),
+            move |args, continuation| {
+                hermetic_process_spawn_handler(
+                    args,
+                    continuation,
+                    Arc::clone(&cache),
+                    &cancellation,
+                )
+            },
+        );
     }
 
     pub fn install_service_supervise(&mut self) {
-        let trace_events = Rc::clone(&self.trace_events);
+        let trace_events = Arc::clone(&self.trace_events);
         let cancellation = self.cancellation.clone();
         self.register(SERVICE_SUPERVISE_OP, move |args, continuation| {
-            service_supervise_handler(args, continuation, Rc::clone(&trace_events), &cancellation)
+            service_supervise_handler(args, continuation, Arc::clone(&trace_events), &cancellation)
         });
     }
 
@@ -405,8 +446,18 @@ impl HostHandler for Host {
             .unwrap_or_else(HostEffectPolicy::volatile)
     }
 
+    fn concurrent_handler(&self, op: &Symbol) -> Option<Arc<ConcurrentHandler>> {
+        self.handlers
+            .get(op)
+            .and_then(|handler| handler.concurrent_handler.clone())
+    }
+
     fn drain_trace_events(&mut self) -> Vec<HostTraceEvent> {
-        self.trace_events.borrow_mut().drain(..).collect()
+        self.trace_events
+            .lock()
+            .expect("host trace event mutex should not be poisoned")
+            .drain(..)
+            .collect()
     }
 }
 
@@ -683,7 +734,12 @@ fn run_hermetic_process_request(
     validate_declared_inputs(&request)?;
     let cache_key = process_cache_key(&request)?;
 
-    if let Some(value) = cache.borrow().get(&cache_key).cloned() {
+    if let Some(value) = cache
+        .lock()
+        .expect("process cache mutex should not be poisoned")
+        .get(&cache_key)
+        .cloned()
+    {
         materialize_cached_outputs(&value)?;
         return Ok(RuntimeValue::Data(value));
     }
@@ -692,7 +748,10 @@ fn run_hermetic_process_request(
     let output = execute_process(&request, cancellation)?;
     let value = process_result_value(request, output);
     if declared_outputs_complete(&value) {
-        cache.borrow_mut().insert(cache_key, value.clone());
+        cache
+            .lock()
+            .expect("process cache mutex should not be poisoned")
+            .insert(cache_key, value.clone());
     }
 
     Ok(RuntimeValue::Data(value))
@@ -713,7 +772,8 @@ fn run_service_supervise(
             .checked_add(1)
             .ok_or_else(|| "service.supervise spawn count overflowed u32".to_string())?;
         trace_events
-            .borrow_mut()
+            .lock()
+            .expect("host trace event mutex should not be poisoned")
             .push(HostTraceEvent::ServiceSpawn {
                 iteration: spawn_count,
             });
@@ -723,17 +783,23 @@ fn run_service_supervise(
         let output = execute_process(&spawn_request, cancellation)?;
         let status = process_status_from_exit_status(output.status);
         let status_value = process_status_value(&status);
-        trace_events.borrow_mut().push(HostTraceEvent::ServiceExit {
-            iteration: spawn_count,
-            status: status_value.clone(),
-        });
+        trace_events
+            .lock()
+            .expect("host trace event mutex should not be poisoned")
+            .push(HostTraceEvent::ServiceExit {
+                iteration: spawn_count,
+                status: status_value.clone(),
+            });
 
         match service_restart_decision(restart_policy, &status, spawn_count)? {
             ServiceRestartDecision::Stop => {
-                trace_events.borrow_mut().push(HostTraceEvent::ServiceStop {
-                    restart_count,
-                    final_status: status_value.clone(),
-                });
+                trace_events
+                    .lock()
+                    .expect("host trace event mutex should not be poisoned")
+                    .push(HostTraceEvent::ServiceStop {
+                        restart_count,
+                        final_status: status_value.clone(),
+                    });
                 return Ok(service_supervise_result_value(status_value, restart_count));
             }
             ServiceRestartDecision::Restart { delay_nanos } => {
@@ -744,7 +810,8 @@ fn run_service_supervise(
                     sleep_with_cancellation(delay_nanos, cancellation)?;
                 }
                 trace_events
-                    .borrow_mut()
+                    .lock()
+                    .expect("host trace event mutex should not be poisoned")
                     .push(HostTraceEvent::ServiceRestart {
                         next_iteration: spawn_count + 1,
                     });

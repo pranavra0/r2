@@ -157,9 +157,13 @@ pub struct GcReport {
     pub deleted_cache_entries: usize,
 }
 
-pub trait ObjectStore {
+pub trait ObjectStore: Clone + Send + Sync {
     fn put(&mut self, object: Stored) -> Result<Ref, StoreError>;
     fn get(&self, reference: &Ref) -> Result<Option<Stored>, StoreError>;
+
+    fn merge_from(&mut self, _other: Self) -> Result<(), StoreError> {
+        Ok(())
+    }
 
     fn put_cached_thunk(&mut self, _key: Digest, _cached: CachedThunk) -> Result<(), StoreError> {
         Ok(())
@@ -688,6 +692,12 @@ impl ObjectStore for MemoryStore {
 
     fn get_cached_thunk(&self, key: &Digest) -> Result<Option<CachedThunk>, StoreError> {
         Ok(self.thunk_cache.get(key).cloned())
+    }
+
+    fn merge_from(&mut self, other: Self) -> Result<(), StoreError> {
+        self.objects.extend(other.objects);
+        self.thunk_cache.extend(other.thunk_cache);
+        Ok(())
     }
 }
 

@@ -201,13 +201,61 @@ fn trace_command_reports_force_all_batches() {
     assert!(stdout.contains("- thunk forces: single "), "{stdout}");
     assert!(stdout.contains("batches 1"), "{stdout}");
     assert!(stdout.contains("yield: thunk.force_all"), "{stdout}");
-    assert!(stdout.contains("thunk force_all: 2"), "{stdout}");
+    assert!(stdout.contains("thunk force_all["), "{stdout}");
+    assert!(stdout.contains("]: 2"), "{stdout}");
+    assert!(stdout.contains("task "), "{stdout}");
+    assert!(stdout.contains("start: frontier"), "{stdout}");
+    assert!(stdout.contains("end: frontier"), "{stdout}");
     assert!(
         stdout.contains("builtin handle: thunk.force_all"),
         "{stdout}"
     );
 
     let _ = std::fs::remove_file(program_path);
+}
+
+#[test]
+fn trace_command_keeps_force_all_volatile_branches_uncached() {
+    let program_path = unique_temp_path("r2-cli-program-trace-force-all-volatile", "r2");
+    let target_path = unique_temp_path("r2-cli-force-all-volatile-output", "txt");
+    let program = format!(
+        "perform thunk.force_all(lazy {{ perform fs.write({}, {}) }}, lazy {{ 99 }})",
+        string_literal(target_path.to_string_lossy().as_ref()),
+        string_literal("hello")
+    );
+    std::fs::write(&program_path, program).expect("program should write");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_r2"))
+        .arg("trace")
+        .arg("--summary")
+        .arg("--memory-store")
+        .arg(&program_path)
+        .output()
+        .expect("cli should run");
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("result: [ok({written: 5}), 99]\n"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("- thunk cache: hits 0, stores 2, bypasses 2"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("host handle: fs.write [volatile]"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("due to volatile effect fs.write"),
+        "{stdout}"
+    );
+    assert_eq!(std::fs::read_to_string(&target_path).unwrap(), "hello");
+
+    let _ = std::fs::remove_file(program_path);
+    let _ = std::fs::remove_file(target_path);
 }
 
 #[test]

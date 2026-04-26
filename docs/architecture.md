@@ -88,9 +88,17 @@ and `store gc`.
 Thunk caching happens inside the built-in thunk forcing path. A thunk is cached
 only if the whole forced computation avoids non-cacheable host effects.
 `thunk.force_all` is a semantic bridge for build DAG frontiers: it forces a
-batch of independent thunks and returns their data results as a list. It is
-sequential today, but gives the scheduler one explicit place to add parallel
-forcing without adding a graph primitive to the core calculus.
+batch of independent thunks and returns their data results as a list. It
+reifies thunks to closed terms, runs branch runtimes through rayon, and merges
+their cache/store/trace effects back into the parent runtime. Host dispatch is
+serialized by default, but handlers can expose a cloneable concurrent path.
+The built-in hermetic `process.spawn` handler uses that path, so build DAG
+frontiers can run independent declared process actions concurrently while
+volatile effects remain serialized. Cacheability taint propagates through both
+`thunk.force` and `thunk.force_all`: if a nested forced computation touches a
+volatile effect, every enclosing thunk bypasses its cache too. Top-level record
+fields still evaluate sequentially; parallel build work should be expressed as
+one target whose dependencies form a frontier.
 
 ## Store Model
 
