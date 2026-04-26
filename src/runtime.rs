@@ -11,6 +11,8 @@ use crate::host::{
 use crate::store::{CachedThunk, MemoryStore, ObjectStore, StoreError, Stored};
 use crate::thunk::{self, ThunkError};
 
+const DEFAULT_CACHE_LIMIT: usize = 10_000;
+
 #[derive(Debug)]
 pub enum RuntimeError {
     Eval(EvalError),
@@ -372,6 +374,10 @@ pub struct Runtime<S = MemoryStore> {
     store: S,
     memo: BTreeMap<Digest, Reified>,
     thunk_cache: BTreeMap<Digest, Reified>,
+    memo_order: Vec<Digest>,
+    thunk_cache_order: Vec<Digest>,
+    max_memo_entries: usize,
+    max_thunk_cache_entries: usize,
 }
 
 impl Runtime<MemoryStore> {
@@ -392,6 +398,10 @@ impl<S> Runtime<S> {
             store,
             memo: BTreeMap::new(),
             thunk_cache: BTreeMap::new(),
+            memo_order: Vec::new(),
+            thunk_cache_order: Vec::new(),
+            max_memo_entries: DEFAULT_CACHE_LIMIT,
+            max_thunk_cache_entries: DEFAULT_CACHE_LIMIT,
         }
     }
 
@@ -409,6 +419,74 @@ impl<S> Runtime<S> {
 
     pub fn thunk_cache_len(&self) -> usize {
         self.thunk_cache.len()
+    }
+
+    pub fn with_memo_limit(mut self, max_entries: usize) -> Self {
+        self.max_memo_entries = max_entries;
+        self.evict_memo_to_limit();
+        self
+    }
+
+    pub fn with_thunk_cache_limit(mut self, max_entries: usize) -> Self {
+        self.max_thunk_cache_entries = max_entries;
+        self.evict_thunk_cache_to_limit();
+        self
+    }
+
+    pub fn max_memo_entries(&self) -> usize {
+        self.max_memo_entries
+    }
+
+    pub fn max_thunk_cache_entries(&self) -> usize {
+        self.max_thunk_cache_entries
+    }
+
+    fn insert_memo(&mut self, digest: Digest, value: Reified) {
+        self.memo.insert(digest, value);
+        touch_access_order(&mut self.memo_order, digest);
+        self.evict_memo_to_limit();
+    }
+
+    fn get_memo(&mut self, digest: &Digest) -> Option<Reified> {
+        let value = self.memo.get(digest).cloned();
+        if value.is_some() {
+            touch_access_order(&mut self.memo_order, *digest);
+        }
+        value
+    }
+
+    fn evict_memo_to_limit(&mut self) {
+        while self.memo.len() > self.max_memo_entries {
+            let Some(digest) = self.memo_order.first().copied() else {
+                break;
+            };
+            self.memo_order.remove(0);
+            self.memo.remove(&digest);
+        }
+    }
+
+    fn insert_thunk_cache(&mut self, digest: Digest, value: Reified) {
+        self.thunk_cache.insert(digest, value);
+        touch_access_order(&mut self.thunk_cache_order, digest);
+        self.evict_thunk_cache_to_limit();
+    }
+
+    fn get_thunk_cache(&mut self, digest: &Digest) -> Option<Reified> {
+        let value = self.thunk_cache.get(digest).cloned();
+        if value.is_some() {
+            touch_access_order(&mut self.thunk_cache_order, *digest);
+        }
+        value
+    }
+
+    fn evict_thunk_cache_to_limit(&mut self) {
+        while self.thunk_cache.len() > self.max_thunk_cache_entries {
+            let Some(digest) = self.thunk_cache_order.first().copied() else {
+                break;
+            };
+            self.thunk_cache_order.remove(0);
+            self.thunk_cache.remove(&digest);
+        }
     }
 }
 
@@ -444,7 +522,7 @@ impl<S: ObjectStore> Runtime<S> {
             digest,
         });
 
-        if let Some(reified) = digest.and_then(|digest| self.memo.get(&digest).cloned()) {
+        if let Some(reified) = digest.and_then(|digest| self.get_memo(&digest)) {
             trace.record(RuntimeTraceEvent::MemoHit {
                 digest: digest.unwrap(),
             });
@@ -456,7 +534,7 @@ impl<S: ObjectStore> Runtime<S> {
         if let (Some(digest), EvalResult::Done(value)) = (&digest, &result)
             && let Some(reified) = value.reify()
         {
-            self.memo.insert(*digest, reified);
+            self.insert_memo(*digest, reified);
             trace.record(RuntimeTraceEvent::MemoStore { digest: *digest });
         }
 
@@ -705,13 +783,13 @@ impl<S: ObjectStore> Runtime<S> {
         let (key, term) = reified_thunk_term(&thunk_value)?;
         trace.record(RuntimeTraceEvent::ThunkForce { key });
 
-        if let Some(reified) = self.thunk_cache.get(&key).cloned() {
+        if let Some(reified) = self.get_thunk_cache(&key) {
             trace.record(RuntimeTraceEvent::ThunkCacheHit { key });
             return Ok(reified.into_runtime());
         }
 
         if let Some(reified) = self.load_cached_thunk_with_trace(&key, trace)? {
-            self.thunk_cache.insert(key, reified.clone());
+            self.insert_thunk_cache(key, reified.clone());
             trace.record(RuntimeTraceEvent::ThunkCacheHit { key });
             return Ok(reified.into_runtime());
         }
@@ -734,7 +812,7 @@ impl<S: ObjectStore> Runtime<S> {
             .clone();
 
         self.persist_reified_with_trace(key, &reified, trace)?;
-        self.thunk_cache.insert(key, reified.clone());
+        self.insert_thunk_cache(key, reified.clone());
         trace.record(RuntimeTraceEvent::ThunkCacheStore { key });
         Ok(reified.into_runtime())
     }
@@ -836,6 +914,13 @@ impl Stored {
             Self::Value(_) => RuntimeStoredKind::Value,
         }
     }
+}
+
+fn touch_access_order(order: &mut Vec<Digest>, digest: Digest) {
+    if let Some(index) = order.iter().position(|entry| *entry == digest) {
+        order.remove(index);
+    }
+    order.push(digest);
 }
 
 #[cfg(test)]
@@ -1192,5 +1277,38 @@ mod tests {
         assert_eq!(summary.persisted_values, 1);
         assert_eq!(summary.persisted_terms, 0);
         assert_eq!(summary.run_completions, 2);
+    }
+
+    #[test]
+    fn memo_cache_respects_configured_entry_limit() {
+        let mut runtime = Runtime::new().with_memo_limit(2);
+        let mut host = Host::new();
+
+        for value in 0..5 {
+            runtime
+                .run(Term::Value(Value::Integer(value)), &mut host)
+                .expect("program should run");
+        }
+
+        assert_eq!(runtime.max_memo_entries(), 2);
+        assert!(runtime.memo_len() <= 2);
+    }
+
+    #[test]
+    fn thunk_cache_respects_configured_entry_limit() {
+        let mut runtime = Runtime::new().with_thunk_cache_limit(2);
+        let mut host = Host::new();
+
+        for value in 0..5 {
+            runtime
+                .run(
+                    thunk::force(thunk::delay(Term::Value(Value::Integer(value)))),
+                    &mut host,
+                )
+                .expect("program should run");
+        }
+
+        assert_eq!(runtime.max_thunk_cache_entries(), 2);
+        assert!(runtime.thunk_cache_len() <= 2);
     }
 }

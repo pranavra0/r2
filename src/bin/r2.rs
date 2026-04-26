@@ -2,9 +2,10 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::str::FromStr;
 
 use r2::{
-    FileStore, Host, ObjectStore, Reified, Runtime, RuntimeTrace, RuntimeTraceSummary,
+    Digest, FileStore, Host, ObjectStore, Ref, Reified, Runtime, RuntimeTrace, RuntimeTraceSummary,
     RuntimeValue, TracedRun, Value, parse_program,
 };
 
@@ -23,6 +24,7 @@ fn run() -> Result<(), String> {
     match args.next().as_deref() {
         Some("run") => run_file(args, false),
         Some("trace") => run_file(args, true),
+        Some("store") => run_store(args),
         Some("--help") | Some("-h") => {
             println!("{}", usage());
             Ok(())
@@ -33,7 +35,70 @@ fn run() -> Result<(), String> {
 }
 
 fn usage() -> &'static str {
-    "Usage: r2 run [--trace] [--summary] [--store <path>|--memory-store] <file>\n       r2 trace [--summary] [--store <path>|--memory-store] <file>\n       r2 --help\n\nStore defaults to $XDG_STATE_HOME/r2/store on Unix, %LOCALAPPDATA%\\r2\\store on Windows, or .r2-store."
+    "Usage: r2 run [--trace] [--summary] [--store <path>|--memory-store] <file>\n       r2 trace [--summary] [--store <path>|--memory-store] <file>\n       r2 store gc [--store <path>] [--root <hash>]...\n       r2 --help\n\nStore defaults to $XDG_STATE_HOME/r2/store on Unix, %LOCALAPPDATA%\\r2\\store on Windows, or .r2-store."
+}
+
+fn run_store(args: impl Iterator<Item = String>) -> Result<(), String> {
+    let mut args = args;
+    match args.next().as_deref() {
+        Some("gc") => run_store_gc(args),
+        Some(command) => Err(format!("unknown store command `{command}`\n\n{}", usage())),
+        None => Err(format!("expected store command\n\n{}", usage())),
+    }
+}
+
+fn run_store_gc(args: impl Iterator<Item = String>) -> Result<(), String> {
+    let mut store_path = None;
+    let mut roots = Vec::new();
+    let mut args = args.peekable();
+
+    while let Some(arg) = args.next() {
+        if arg == "--store" {
+            let Some(value) = args.next() else {
+                return Err(format!("expected path after --store\n\n{}", usage()));
+            };
+            store_path = Some(PathBuf::from(value));
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("--store=") {
+            if value.is_empty() {
+                return Err(format!("expected path after --store=\n\n{}", usage()));
+            }
+            store_path = Some(PathBuf::from(value));
+            continue;
+        }
+        if arg == "--root" {
+            let Some(value) = args.next() else {
+                return Err(format!("expected hash after --root\n\n{}", usage()));
+            };
+            roots.push(parse_root(&value)?);
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("--root=") {
+            roots.push(parse_root(value)?);
+            continue;
+        }
+        return Err(format!("unknown flag `{arg}`\n\n{}", usage()));
+    }
+
+    let store_path = store_path.unwrap_or_else(default_store_path);
+    let store = FileStore::open(&store_path)
+        .map_err(|error| format!("failed to open store {}: {error}", store_path.display()))?;
+    let report = store
+        .gc(&roots)
+        .map_err(|error| format!("failed to gc store {}: {error}", store_path.display()))?;
+
+    println!("reachable: {}", report.reachable);
+    println!("kept objects: {}", report.kept_objects);
+    println!("deleted objects: {}", report.deleted_objects);
+    println!("deleted cache entries: {}", report.deleted_cache_entries);
+    Ok(())
+}
+
+fn parse_root(value: &str) -> Result<Ref, String> {
+    Digest::from_str(value)
+        .map(Ref::new)
+        .map_err(|error| format!("invalid root hash `{value}`: {error}"))
 }
 
 fn run_file(args: impl Iterator<Item = String>, force_trace: bool) -> Result<(), String> {

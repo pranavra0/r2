@@ -30,6 +30,6 @@ pub use runtime::{
 pub use service::{
     RestartDecision, RestartDelay, RestartMode, RestartPolicy, Service, ServiceSpec,
 };
-pub use store::{CachedThunk, FileStore, MemoryStore, ObjectStore, StoreError, Stored};
+pub use store::{CachedThunk, FileStore, GcReport, MemoryStore, ObjectStore, StoreError, Stored};
 pub use syntax::{SyntaxError, parse as parse_program};
 pub use thunk::{ThunkError, delay, force};
