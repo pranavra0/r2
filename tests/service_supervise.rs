@@ -76,8 +76,8 @@ fn service_supervise_restarts_failures_until_limit() {
     assert!(matches!(
         events
             .iter()
-            .find(|event| matches!(event, RuntimeTraceEvent::ServiceSpawn { iteration: 1 })),
-        Some(RuntimeTraceEvent::ServiceSpawn { iteration: 1 })
+            .find(|event| is_service_event(event, "spawn", Some(("iteration", 1)))),
+        Some(RuntimeTraceEvent::HostEvent { .. })
     ));
     assert_event_order(events);
 
@@ -249,30 +249,50 @@ fn assert_event_order(events: &[RuntimeTraceEvent]) {
     let service_events = events
         .iter()
         .filter(|event| {
-            matches!(
-                event,
-                RuntimeTraceEvent::ServiceSpawn { .. }
-                    | RuntimeTraceEvent::ServiceExit { .. }
-                    | RuntimeTraceEvent::ServiceRestart { .. }
-                    | RuntimeTraceEvent::ServiceStop { .. }
-            )
+            is_service_event(event, "spawn", None)
+                || is_service_event(event, "exit", None)
+                || is_service_event(event, "restart", None)
+                || is_service_event(event, "stop", None)
         })
         .collect::<Vec<_>>();
 
-    assert!(matches!(
-        service_events.as_slice(),
-        [
-            RuntimeTraceEvent::ServiceSpawn { iteration: 1 },
-            RuntimeTraceEvent::ServiceExit { iteration: 1, .. },
-            RuntimeTraceEvent::ServiceRestart { next_iteration: 2 },
-            RuntimeTraceEvent::ServiceSpawn { iteration: 2 },
-            RuntimeTraceEvent::ServiceExit { iteration: 2, .. },
-            RuntimeTraceEvent::ServiceRestart { next_iteration: 3 },
-            RuntimeTraceEvent::ServiceSpawn { iteration: 3 },
-            RuntimeTraceEvent::ServiceExit { iteration: 3, .. },
-            RuntimeTraceEvent::ServiceStop { .. },
-        ]
+    let expected = [
+        ("spawn", "iteration", 1),
+        ("exit", "iteration", 1),
+        ("restart", "next_iteration", 2),
+        ("spawn", "iteration", 2),
+        ("exit", "iteration", 2),
+        ("restart", "next_iteration", 3),
+        ("spawn", "iteration", 3),
+        ("exit", "iteration", 3),
+    ];
+
+    assert_eq!(service_events.len(), expected.len() + 1);
+    for (event, (phase, field, value)) in service_events.iter().zip(expected) {
+        assert!(is_service_event(event, phase, Some((field, value))));
+    }
+    assert!(is_service_event(
+        service_events.last().expect("stop event should exist"),
+        "stop",
+        None
     ));
+}
+
+#[cfg(unix)]
+fn is_service_event(
+    event: &RuntimeTraceEvent,
+    expected_phase: &str,
+    expected_integer: Option<(&str, i64)>,
+) -> bool {
+    let RuntimeTraceEvent::HostEvent { op, phase, fields } = event else {
+        return false;
+    };
+    if op.as_str() != "service.supervise" || phase.as_str() != expected_phase {
+        return false;
+    }
+    expected_integer.is_none_or(|(name, expected)| {
+        fields.get(&Symbol::from(name)) == Some(&Value::Integer(expected))
+    })
 }
 
 #[cfg(unix)]

@@ -6,13 +6,18 @@ use std::path::PathBuf;
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use crate::effects::process;
 use crate::{
     CancellationToken, Canonical, Continuation, Digest, EvalError, EvalResult, RuntimeValue,
     Symbol, Value,
 };
+
+mod clock;
+mod fs;
+mod math;
+mod supervise;
 
 type Handler = dyn FnMut(Vec<RuntimeValue>, Continuation) -> Result<EvalResult, HostError> + Send;
 pub type ConcurrentHandler =
@@ -218,19 +223,10 @@ struct RegisteredHandler {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HostTraceEvent {
-    ServiceSpawn {
-        iteration: u32,
-    },
-    ServiceExit {
-        iteration: u32,
-        status: Value,
-    },
-    ServiceRestart {
-        next_iteration: u32,
-    },
-    ServiceStop {
-        restart_count: u32,
-        final_status: Value,
+    Lifecycle {
+        op: Symbol,
+        phase: Symbol,
+        fields: BTreeMap<Symbol, Value>,
     },
 }
 
@@ -249,26 +245,6 @@ struct ProcessSpawnRequest {
 enum EnvMode {
     Clear,
     Inherit,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ServiceRestartMode {
-    Never,
-    Always,
-    OnFailure,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ServiceRestartPolicy {
-    mode: ServiceRestartMode,
-    max_restarts: Option<u32>,
-    delay_nanos: i64,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ServiceRestartDecision {
-    Stop,
-    Restart { delay_nanos: i64 },
 }
 
 pub struct Host {
@@ -366,11 +342,11 @@ impl Host {
     }
 
     pub fn install_fs_read(&mut self) {
-        self.register(FS_READ_OP, fs_read_handler);
+        self.register(FS_READ_OP, fs::read_handler);
     }
 
     pub fn install_fs_write(&mut self) {
-        self.register(FS_WRITE_OP, fs_write_handler);
+        self.register(FS_WRITE_OP, fs::write_handler);
     }
 
     pub fn install_process_spawn(&mut self) {
@@ -398,7 +374,7 @@ impl Host {
         let trace_events = Arc::clone(&self.trace_events);
         let cancellation = self.cancellation.clone();
         self.register(SERVICE_SUPERVISE_OP, move |args, continuation| {
-            service_supervise_handler(args, continuation, Arc::clone(&trace_events), &cancellation)
+            supervise::handler(args, continuation, Arc::clone(&trace_events), &cancellation)
         });
     }
 
@@ -408,73 +384,18 @@ impl Host {
     }
 
     pub fn install_clock_now(&mut self) {
-        self.register(CLOCK_NOW_OP, clock_now_handler);
+        self.register(CLOCK_NOW_OP, clock::now_handler);
     }
 
     pub fn install_clock_sleep(&mut self) {
         let cancellation = self.cancellation.clone();
         self.register(CLOCK_SLEEP_OP, move |args, continuation| {
-            clock_sleep_handler(args, continuation, &cancellation)
+            clock::sleep_handler(args, continuation, &cancellation)
         });
     }
 
     pub fn install_math(&mut self) {
-        self.register_stable(MATH_ADD_OP, |args, continuation| {
-            math_integer_handler(args, continuation, MATH_ADD_OP, |left, right| {
-                left.checked_add(right)
-                    .ok_or_else(|| "math.add overflowed i64".to_string())
-            })
-        });
-        self.register_stable(MATH_SUB_OP, |args, continuation| {
-            math_integer_handler(args, continuation, MATH_SUB_OP, |left, right| {
-                left.checked_sub(right)
-                    .ok_or_else(|| "math.sub overflowed i64".to_string())
-            })
-        });
-        self.register_stable(MATH_MUL_OP, |args, continuation| {
-            math_integer_handler(args, continuation, MATH_MUL_OP, |left, right| {
-                left.checked_mul(right)
-                    .ok_or_else(|| "math.mul overflowed i64".to_string())
-            })
-        });
-        self.register_stable(MATH_DIV_OP, |args, continuation| {
-            math_integer_handler(args, continuation, MATH_DIV_OP, |left, right| {
-                if right == 0 {
-                    Err("math.div cannot divide by zero".to_string())
-                } else {
-                    left.checked_div(right)
-                        .ok_or_else(|| "math.div overflowed i64".to_string())
-                }
-            })
-        });
-        self.register_stable(MATH_REM_OP, |args, continuation| {
-            math_integer_handler(args, continuation, MATH_REM_OP, |left, right| {
-                if right == 0 {
-                    Err("math.rem cannot divide by zero".to_string())
-                } else {
-                    left.checked_rem(right)
-                        .ok_or_else(|| "math.rem overflowed i64".to_string())
-                }
-            })
-        });
-        self.register_stable(MATH_EQ_OP, |args, continuation| {
-            math_compare_handler(args, continuation, MATH_EQ_OP, |left, right| left == right)
-        });
-        self.register_stable(MATH_NE_OP, |args, continuation| {
-            math_compare_handler(args, continuation, MATH_NE_OP, |left, right| left != right)
-        });
-        self.register_stable(MATH_LT_OP, |args, continuation| {
-            math_compare_handler(args, continuation, MATH_LT_OP, |left, right| left < right)
-        });
-        self.register_stable(MATH_LE_OP, |args, continuation| {
-            math_compare_handler(args, continuation, MATH_LE_OP, |left, right| left <= right)
-        });
-        self.register_stable(MATH_GT_OP, |args, continuation| {
-            math_compare_handler(args, continuation, MATH_GT_OP, |left, right| left > right)
-        });
-        self.register_stable(MATH_GE_OP, |args, continuation| {
-            math_compare_handler(args, continuation, MATH_GE_OP, |left, right| left >= right)
-        });
+        math::install(self);
     }
 }
 
@@ -552,92 +473,6 @@ impl From<EvalError> for HostError {
     }
 }
 
-fn fs_read_handler(
-    args: Vec<RuntimeValue>,
-    continuation: Continuation,
-) -> Result<EvalResult, HostError> {
-    let value = match parse_fs_read_args(args.as_slice()) {
-        Ok(path) => RuntimeValue::Data(fs_read_result_value(path)),
-        Err(message) => error_value(message),
-    };
-
-    continuation.resume(value).map_err(Into::into)
-}
-
-fn fs_write_handler(
-    args: Vec<RuntimeValue>,
-    continuation: Continuation,
-) -> Result<EvalResult, HostError> {
-    let value = match parse_fs_write_args(args.as_slice()) {
-        Ok((path, contents)) => RuntimeValue::Data(fs_write_result_value(path, contents)),
-        Err(message) => error_value(message),
-    };
-
-    continuation.resume(value).map_err(Into::into)
-}
-
-fn parse_fs_read_args(args: &[RuntimeValue]) -> Result<Vec<u8>, String> {
-    match args {
-        [RuntimeValue::Data(Value::Record(request))] => parse_fs_read_request(request),
-        [RuntimeValue::Data(Value::Bytes(path))] => Ok(path.clone()),
-        _ => Err(
-            "fs.read expected either one record request argument or one bytes path argument"
-                .to_string(),
-        ),
-    }
-}
-
-fn parse_fs_write_args(args: &[RuntimeValue]) -> Result<(Vec<u8>, Vec<u8>), String> {
-    match args {
-        [RuntimeValue::Data(Value::Record(request))] => parse_fs_write_request(request),
-        [
-            RuntimeValue::Data(Value::Bytes(path)),
-            RuntimeValue::Data(Value::Bytes(contents)),
-        ] => Ok((path.clone(), contents.clone())),
-        _ => Err(
-            "fs.write expected either one record request argument or a bytes path and bytes contents"
-                .to_string(),
-        ),
-    }
-}
-
-fn parse_fs_read_request(request: &BTreeMap<Symbol, Value>) -> Result<Vec<u8>, String> {
-    parse_bytes(
-        required_record_field(request, "path", FS_READ_OP)?,
-        "fs.read field `path` must be bytes",
-    )
-}
-
-fn parse_fs_write_request(request: &BTreeMap<Symbol, Value>) -> Result<(Vec<u8>, Vec<u8>), String> {
-    Ok((
-        parse_bytes(
-            required_record_field(request, "path", FS_WRITE_OP)?,
-            "fs.write field `path` must be bytes",
-        )?,
-        parse_bytes(
-            required_record_field(request, "contents", FS_WRITE_OP)?,
-            "fs.write field `contents` must be bytes",
-        )?,
-    ))
-}
-
-fn fs_read_result_value(path: Vec<u8>) -> Value {
-    match std::fs::read(path_from_bytes(path)) {
-        Ok(contents) => ok_record_value([("contents", Value::Bytes(contents))]),
-        Err(error) => io_error_value(error),
-    }
-}
-
-fn fs_write_result_value(path: Vec<u8>, contents: Vec<u8>) -> Value {
-    match std::fs::write(path_from_bytes(path), &contents) {
-        Ok(()) => ok_record_value([(
-            "written",
-            Value::Integer(i64::try_from(contents.len()).expect("byte length should fit into i64")),
-        )]),
-        Err(error) => io_error_value(error),
-    }
-}
-
 fn process_spawn_handler(
     args: Vec<RuntimeValue>,
     continuation: Continuation,
@@ -672,113 +507,10 @@ fn hermetic_process_spawn_handler(
     continuation.resume(value).map_err(Into::into)
 }
 
-fn service_supervise_handler(
-    args: Vec<RuntimeValue>,
-    continuation: Continuation,
-    trace_events: HostTraceEvents,
-    cancellation: &CancellationToken,
-) -> Result<EvalResult, HostError> {
-    let value = match args.as_slice() {
-        [RuntimeValue::Data(Value::Record(request))] => {
-            match run_service_supervise(request, trace_events, cancellation) {
-                Ok(value) => RuntimeValue::Data(value),
-                Err(message) => error_value(message),
-            }
-        }
-        _ => error_value("service.supervise expected one record service spec argument"),
-    };
-
-    continuation.resume(value).map_err(Into::into)
-}
-
-fn clock_now_handler(
-    args: Vec<RuntimeValue>,
-    continuation: Continuation,
-) -> Result<EvalResult, HostError> {
-    let value = match args.as_slice() {
-        [RuntimeValue::Data(Value::Record(request))] => {
-            match parse_empty_clock_request(request, CLOCK_NOW_OP) {
-                Ok(()) => match unix_time_nanos() {
-                    Ok(unix_nanos) => RuntimeValue::Data(ok_record_value([(
-                        "unix_nanos",
-                        Value::Integer(unix_nanos),
-                    )])),
-                    Err(message) => error_value(message),
-                },
-                Err(message) => error_value(message),
-            }
-        }
-        _ => error_value("clock.now expected one record request argument"),
-    };
-
-    continuation.resume(value).map_err(Into::into)
-}
-
-fn clock_sleep_handler(
-    args: Vec<RuntimeValue>,
-    continuation: Continuation,
-    cancellation: &CancellationToken,
-) -> Result<EvalResult, HostError> {
-    let value = match args.as_slice() {
-        [RuntimeValue::Data(Value::Record(request))] => match parse_sleep_request(request) {
-            Ok(duration_nanos) => match sleep_with_cancellation(duration_nanos, cancellation) {
-                Ok(()) => RuntimeValue::Data(ok_record_value([(
-                    "duration_nanos",
-                    Value::Integer(duration_nanos),
-                )])),
-                Err(message) => error_value(message),
-            },
-            Err(message) => error_value(message),
-        },
-        _ => error_value("clock.sleep expected one record request argument"),
-    };
-
-    continuation.resume(value).map_err(Into::into)
-}
-
-fn math_integer_handler(
-    args: Vec<RuntimeValue>,
-    continuation: Continuation,
-    op: &str,
-    operation: impl FnOnce(i64, i64) -> Result<i64, String>,
-) -> Result<EvalResult, HostError> {
-    let value = match parse_math_integer_args(args.as_slice(), op).and_then(|(left, right)| {
-        operation(left, right).map(|value| RuntimeValue::Data(Value::Integer(value)))
-    }) {
-        Ok(value) => value,
-        Err(message) => error_value(message),
-    };
-
-    continuation.resume(value).map_err(Into::into)
-}
-
-fn math_compare_handler(
-    args: Vec<RuntimeValue>,
-    continuation: Continuation,
-    op: &str,
-    operation: impl FnOnce(i64, i64) -> bool,
-) -> Result<EvalResult, HostError> {
-    let value = match parse_math_integer_args(args.as_slice(), op) {
-        Ok((left, right)) => RuntimeValue::Data(boolean_value(operation(left, right))),
-        Err(message) => error_value(message),
-    };
-
-    continuation.resume(value).map_err(Into::into)
-}
-
-fn parse_math_integer_args(args: &[RuntimeValue], op: &str) -> Result<(i64, i64), String> {
-    match args {
-        [RuntimeValue::Data(left), RuntimeValue::Data(right)] => Ok((
-            parse_integer(left, &format!("{op} left argument must be an integer"))?,
-            parse_integer(right, &format!("{op} right argument must be an integer"))?,
-        )),
-        _ => Err(format!("{op} expected two integer arguments")),
-    }
-}
-
 fn run_process_request(request: &BTreeMap<Symbol, Value>) -> Result<RuntimeValue, String> {
     let request = parse_process_request(request)?;
     validate_declared_inputs(&request)?;
+    ensure_declared_output_parents(&request)?;
     let output = execute_process(&request, &CancellationToken::new())?;
     Ok(RuntimeValue::Data(process_result_value(request, output)))
 }
@@ -804,6 +536,7 @@ fn run_hermetic_process_request(
     }
 
     enforce_process_sandbox(&request)?;
+    ensure_declared_output_parents(&request)?;
     let output = execute_process(&request, cancellation)?;
     let declared_inputs_value = declared_input_files_cache_value(&request.declared_inputs)?;
     let input_digest = declared_inputs_value.digest();
@@ -816,69 +549,6 @@ fn run_hermetic_process_request(
     }
 
     Ok(RuntimeValue::Data(value))
-}
-
-fn run_service_supervise(
-    request: &BTreeMap<Symbol, Value>,
-    trace_events: HostTraceEvents,
-    cancellation: &CancellationToken,
-) -> Result<Value, String> {
-    let (spawn_request, restart_policy) = parse_service_spec(request)?;
-    let mut spawn_count = 0_u32;
-    let mut restart_count = 0_u32;
-
-    loop {
-        check_cancelled(cancellation)?;
-        spawn_count = spawn_count
-            .checked_add(1)
-            .ok_or_else(|| "service.supervise spawn count overflowed u32".to_string())?;
-        trace_events
-            .lock()
-            .expect("host trace event mutex should not be poisoned")
-            .push(HostTraceEvent::ServiceSpawn {
-                iteration: spawn_count,
-            });
-
-        validate_declared_inputs(&spawn_request)?;
-        enforce_process_sandbox(&spawn_request)?;
-        let output = execute_process(&spawn_request, cancellation)?;
-        let status = process_status_from_exit_status(output.status);
-        let status_value = process_status_value(&status);
-        trace_events
-            .lock()
-            .expect("host trace event mutex should not be poisoned")
-            .push(HostTraceEvent::ServiceExit {
-                iteration: spawn_count,
-                status: status_value.clone(),
-            });
-
-        match service_restart_decision(restart_policy, &status, spawn_count)? {
-            ServiceRestartDecision::Stop => {
-                trace_events
-                    .lock()
-                    .expect("host trace event mutex should not be poisoned")
-                    .push(HostTraceEvent::ServiceStop {
-                        restart_count,
-                        final_status: status_value.clone(),
-                    });
-                return Ok(service_supervise_result_value(status_value, restart_count));
-            }
-            ServiceRestartDecision::Restart { delay_nanos } => {
-                restart_count = restart_count
-                    .checked_add(1)
-                    .ok_or_else(|| "service.supervise restart count overflowed u32".to_string())?;
-                if delay_nanos > 0 {
-                    sleep_with_cancellation(delay_nanos, cancellation)?;
-                }
-                trace_events
-                    .lock()
-                    .expect("host trace event mutex should not be poisoned")
-                    .push(HostTraceEvent::ServiceRestart {
-                        next_iteration: spawn_count + 1,
-                    });
-            }
-        }
-    }
 }
 
 fn enforce_process_sandbox(request: &ProcessSpawnRequest) -> Result<(), String> {
@@ -931,96 +601,6 @@ fn parse_process_request(request: &BTreeMap<Symbol, Value>) -> Result<ProcessSpa
         declared_inputs,
         declared_outputs,
     })
-}
-
-fn parse_service_spec(
-    request: &BTreeMap<Symbol, Value>,
-) -> Result<(ProcessSpawnRequest, ServiceRestartPolicy), String> {
-    let spawn_request = parse_process_request(request)?;
-    let restart_policy = match request.get(&Symbol::from("restart_policy")) {
-        Some(Value::Record(record)) => parse_service_restart_policy(record)?,
-        Some(_) => {
-            return Err("service.supervise field `restart_policy` must be a record".to_string());
-        }
-        None => ServiceRestartPolicy {
-            mode: ServiceRestartMode::Never,
-            max_restarts: None,
-            delay_nanos: 0,
-        },
-    };
-
-    Ok((spawn_request, restart_policy))
-}
-
-fn parse_service_restart_policy(
-    record: &BTreeMap<Symbol, Value>,
-) -> Result<ServiceRestartPolicy, String> {
-    let mode = match required_record_field(record, "mode", SERVICE_SUPERVISE_OP)? {
-        Value::Bytes(bytes) if bytes == b"never" => ServiceRestartMode::Never,
-        Value::Bytes(bytes) if bytes == b"always" => ServiceRestartMode::Always,
-        Value::Bytes(bytes) if bytes == b"on_failure" => ServiceRestartMode::OnFailure,
-        Value::Symbol(symbol) if symbol.as_str() == "never" => ServiceRestartMode::Never,
-        Value::Symbol(symbol) if symbol.as_str() == "always" => ServiceRestartMode::Always,
-        Value::Symbol(symbol) if symbol.as_str() == "on_failure" => ServiceRestartMode::OnFailure,
-        _ => {
-            return Err(
-                "service.supervise restart_policy.mode must be never, always, or on_failure"
-                    .to_string(),
-            );
-        }
-    };
-    let max_restarts = record
-        .get(&Symbol::from("max_restarts"))
-        .map(|value| {
-            let value = parse_integer(
-                value,
-                "service.supervise restart_policy.max_restarts must be an integer",
-            )?;
-            u32::try_from(value).map_err(|_| {
-                "service.supervise restart_policy.max_restarts must fit u32".to_string()
-            })
-        })
-        .transpose()?;
-    let delay_nanos = record
-        .get(&Symbol::from("delay_nanos"))
-        .map(|value| {
-            parse_integer(
-                value,
-                "service.supervise restart_policy.delay_nanos must be an integer",
-            )
-        })
-        .transpose()?
-        .unwrap_or(0);
-    if delay_nanos < 0 {
-        return Err(
-            "service.supervise restart_policy.delay_nanos must be non-negative".to_string(),
-        );
-    }
-
-    Ok(ServiceRestartPolicy {
-        mode,
-        max_restarts,
-        delay_nanos,
-    })
-}
-
-fn parse_empty_clock_request(request: &BTreeMap<Symbol, Value>, op: &str) -> Result<(), String> {
-    if request.is_empty() {
-        Ok(())
-    } else {
-        Err(format!("{op} request must be an empty record"))
-    }
-}
-
-fn parse_sleep_request(request: &BTreeMap<Symbol, Value>) -> Result<i64, String> {
-    let duration_nanos = parse_integer(
-        required_record_field(request, "duration_nanos", CLOCK_SLEEP_OP)?,
-        "clock.sleep field `duration_nanos` must be an integer",
-    )?;
-    if duration_nanos < 0 {
-        return Err("clock.sleep field `duration_nanos` must be non-negative".to_string());
-    }
-    Ok(duration_nanos)
 }
 
 fn execute_process(
@@ -1104,8 +684,8 @@ fn sleep_with_cancellation(
     delay_nanos: i64,
     cancellation: &CancellationToken,
 ) -> Result<(), String> {
-    let total = u64::try_from(delay_nanos)
-        .map_err(|_| "service.supervise delay overflowed u64".to_string())?;
+    let total =
+        u64::try_from(delay_nanos).map_err(|_| "sleep duration overflowed u64".to_string())?;
     let mut remaining = Duration::from_nanos(total);
     while remaining > Duration::ZERO {
         check_cancelled(cancellation)?;
@@ -1162,6 +742,26 @@ fn validate_declared_inputs(request: &ProcessSpawnRequest) -> Result<(), String>
             format!(
                 "process.spawn declared input {} was not accessible: {error}",
                 path_buf.display()
+            )
+        })?;
+    }
+
+    Ok(())
+}
+
+fn ensure_declared_output_parents(request: &ProcessSpawnRequest) -> Result<(), String> {
+    for path in &request.declared_outputs {
+        let path = path_from_bytes(path.clone());
+        let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        else {
+            continue;
+        };
+        std::fs::create_dir_all(parent).map_err(|error| {
+            format!(
+                "process.spawn failed to create output directory {}: {error}",
+                parent.display()
             )
         })?;
     }
@@ -1491,39 +1091,6 @@ fn process_status_value(status: &process::ProcessStatus) -> Value {
     }
 }
 
-fn service_restart_decision(
-    policy: ServiceRestartPolicy,
-    status: &process::ProcessStatus,
-    spawn_count: u32,
-) -> Result<ServiceRestartDecision, String> {
-    let should_restart = match policy.mode {
-        ServiceRestartMode::Never => false,
-        ServiceRestartMode::Always => true,
-        ServiceRestartMode::OnFailure => !matches!(status, process::ProcessStatus::ExitCode(0)),
-    };
-
-    if !should_restart {
-        return Ok(ServiceRestartDecision::Stop);
-    }
-
-    if let Some(max_restarts) = policy.max_restarts
-        && spawn_count >= max_restarts
-    {
-        return Ok(ServiceRestartDecision::Stop);
-    }
-
-    Ok(ServiceRestartDecision::Restart {
-        delay_nanos: policy.delay_nanos,
-    })
-}
-
-fn service_supervise_result_value(final_status: Value, restart_count: u32) -> Value {
-    ok_record_value([
-        ("final_status", final_status),
-        ("restart_count", Value::Integer(i64::from(restart_count))),
-    ])
-}
-
 fn bytes_list_value(items: Vec<Vec<u8>>) -> Value {
     Value::List(items.into_iter().map(Value::Bytes).collect())
 }
@@ -1660,14 +1227,6 @@ fn parse_env_mode(value: &Value) -> Result<EnvMode, String> {
             "process.spawn field `env_mode` must be either \"clear\" or \"inherit\"".to_string(),
         ),
     }
-}
-
-fn unix_time_nanos() -> Result<i64, String> {
-    let duration = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|error| format!("clock.now failed to read unix time: {error}"))?;
-    i64::try_from(duration.as_nanos())
-        .map_err(|_| "clock.now unix time exceeded i64 nanosecond range".to_string())
 }
 
 fn tagged_record_value(
