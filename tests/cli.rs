@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 use std::process::Command;
+#[cfg(unix)]
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[test]
@@ -241,7 +243,7 @@ fn trace_command_keeps_force_all_volatile_branches_uncached() {
         "{stdout}"
     );
     assert!(
-        stdout.contains("- thunk cache: hits 0, stores 2, bypasses 2"),
+        stdout.contains("- thunk cache: hits 0, stores 2, bypasses 2, invalidations 0"),
         "{stdout}"
     );
     assert!(
@@ -395,8 +397,8 @@ fn build_demo_cli_cold_and_warm_runs_materialize_outputs() {
         return;
     }
 
+    let _demo = BuildDemoGuard::new();
     let store_path = unique_temp_dir("r2-cli-build-demo-store");
-    clean_build_demo_outputs();
 
     let first = Command::new(env!("CARGO_BIN_EXE_r2"))
         .arg("trace")
@@ -443,7 +445,7 @@ fn build_demo_cli_cold_and_warm_runs_materialize_outputs() {
     let second_stdout = String::from_utf8(second.stdout).unwrap();
     assert!(second_stdout.contains("result: ok({"), "{second_stdout}");
     assert!(
-        second_stdout.contains("- thunk cache: hits 6, stores 0, bypasses 0"),
+        second_stdout.contains("- thunk cache: hits 6, stores 0, bypasses 0, invalidations 0"),
         "{second_stdout}"
     );
     assert!(
@@ -468,8 +470,8 @@ fn build_demo_cli_incremental_rebuilds_only_changed_source() {
         return;
     }
 
+    let _demo = BuildDemoGuard::new();
     let store_path = unique_temp_dir("r2-cli-build-demo-incremental-store");
-    clean_build_demo_outputs();
 
     let first = Command::new(env!("CARGO_BIN_EXE_r2"))
         .arg("trace")
@@ -484,7 +486,6 @@ fn build_demo_cli_incremental_rebuilds_only_changed_source() {
     assert_build_demo_binary_runs();
 
     let one_c_path = std::path::PathBuf::from("examples/build-demo/src/one.c");
-    let original_one_c = std::fs::read_to_string(&one_c_path).unwrap();
     std::fs::write(&one_c_path, "int one(void) { return 100; }\n").unwrap();
 
     clean_build_demo_outputs();
@@ -502,11 +503,22 @@ fn build_demo_cli_incremental_rebuilds_only_changed_source() {
     let second_stdout = String::from_utf8(second.stdout).unwrap();
     assert!(second_stdout.contains("result: ok({"), "{second_stdout}");
     assert!(
-        second_stdout.contains("- thunk cache: hits 4, stores 2, bypasses 0"),
+        second_stdout.contains("- thunk cache: hits 4, stores 3, bypasses 0"),
+        "{second_stdout}"
+    );
+    assert!(
+        second_stdout.contains("thunk cache invalidated:"),
         "{second_stdout}"
     );
     assert!(
         second_stdout.contains("host handle: process.spawn [hermetic]"),
+        "{second_stdout}"
+    );
+    assert_eq!(
+        second_stdout
+            .matches("host handle: process.spawn [hermetic]")
+            .count(),
+        2,
         "{second_stdout}"
     );
 
@@ -516,9 +528,7 @@ fn build_demo_cli_incremental_rebuilds_only_changed_source() {
     assert!(output.status.success(), "stderr: {}", stderr(&output));
     assert_eq!(String::from_utf8(output.stdout).unwrap(), "109\n");
 
-    std::fs::write(&one_c_path, original_one_c).unwrap();
     let _ = std::fs::remove_dir_all(store_path);
-    clean_build_demo_outputs();
 }
 
 #[test]
@@ -551,7 +561,7 @@ fn trace_command_can_print_a_summary() {
         "{stdout}"
     );
     assert!(
-        stdout.contains("- thunk cache: hits 1, stores 1, bypasses 0"),
+        stdout.contains("- thunk cache: hits 1, stores 1, bypasses 0, invalidations 0"),
         "{stdout}"
     );
     assert!(stdout.contains("trace:\n"), "{stdout}");
@@ -742,6 +752,38 @@ fn clean_build_demo_outputs() {
         "hello-demo",
     ] {
         let _ = std::fs::remove_file(PathBuf::from("examples/build-demo/out").join(name));
+    }
+}
+
+#[cfg(unix)]
+struct BuildDemoGuard {
+    _lock: MutexGuard<'static, ()>,
+    original_one_c: String,
+}
+
+#[cfg(unix)]
+impl BuildDemoGuard {
+    fn new() -> Self {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let lock = LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("build demo lock should not be poisoned");
+        let original_one_c = std::fs::read_to_string("examples/build-demo/src/one.c")
+            .expect("build demo source should be readable");
+        clean_build_demo_outputs();
+        Self {
+            _lock: lock,
+            original_one_c,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for BuildDemoGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::write("examples/build-demo/src/one.c", &self.original_one_c);
+        clean_build_demo_outputs();
     }
 }
 

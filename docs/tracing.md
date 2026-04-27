@@ -29,6 +29,8 @@ The trace output has three parts:
   event includes the task id and frontier id.
 - `thunk cache store`: a cacheable thunk result was stored.
 - `thunk cache hit`: a cached thunk result was reused.
+- `thunk cache invalidated`: a cached thunk result was rejected because its
+  declared inputs no longer match the cached provenance.
 - `thunk cache bypass`: a thunk touched a non-cacheable effect.
 
 The policy shown on `host handle` explains most cache decisions. For example,

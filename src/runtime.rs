@@ -42,7 +42,10 @@ impl fmt::Display for RuntimeError {
                 write!(f, "cached output materialization failed: {message}")
             }
             Self::CacheInvalidation { message } => {
-                write!(f, "cached thunk invalidated due to changed inputs: {message}")
+                write!(
+                    f,
+                    "cached thunk invalidated due to changed inputs: {message}"
+                )
             }
             Self::Cancelled => f.write_str("cancelled"),
         }
@@ -211,6 +214,9 @@ pub enum RuntimeTraceEvent {
     ThunkCacheStore {
         key: Digest,
     },
+    ThunkCacheInvalidated {
+        key: Digest,
+    },
     ThunkCacheBypass {
         key: Digest,
         op: Option<Symbol>,
@@ -276,6 +282,9 @@ impl fmt::Display for RuntimeTraceEvent {
             }
             Self::ThunkCacheHit { key } => write!(f, "thunk cache hit: {key}"),
             Self::ThunkCacheStore { key } => write!(f, "thunk cache store: {key}"),
+            Self::ThunkCacheInvalidated { key } => {
+                write!(f, "thunk cache invalidated: {key}")
+            }
             Self::ThunkCacheBypass {
                 key,
                 op: Some(op),
@@ -361,6 +370,9 @@ impl RuntimeTrace {
                 RuntimeTraceEvent::TaskEnd { .. } => summary.task_ends += 1,
                 RuntimeTraceEvent::ThunkCacheHit { .. } => summary.thunk_cache_hits += 1,
                 RuntimeTraceEvent::ThunkCacheStore { .. } => summary.thunk_cache_stores += 1,
+                RuntimeTraceEvent::ThunkCacheInvalidated { .. } => {
+                    summary.thunk_cache_invalidations += 1;
+                }
                 RuntimeTraceEvent::ThunkCacheBypass { .. } => summary.thunk_cache_bypasses += 1,
                 RuntimeTraceEvent::Persisted { kind, .. } => {
                     summary.persisted += 1;
@@ -406,6 +418,7 @@ pub struct RuntimeTraceSummary {
     pub task_ends: usize,
     pub thunk_cache_hits: usize,
     pub thunk_cache_stores: usize,
+    pub thunk_cache_invalidations: usize,
     pub thunk_cache_bypasses: usize,
     pub persisted: usize,
     pub persisted_terms: usize,
@@ -1254,21 +1267,23 @@ impl<S: ObjectStore> Runtime<S> {
         cancellation.check()?;
         trace.record(RuntimeTraceEvent::ThunkForce { key });
 
-        if let Some(reified) = self.get_thunk_cache(&key)
-            && verify_reified_cached_effect_inputs(&reified)?
-        {
-            materialize_reified_cached_effect_outputs(&reified)?;
-            trace.record(RuntimeTraceEvent::ThunkCacheHit { key });
-            return Ok(ForcedThunk::cacheable(reified.into_runtime()));
+        if let Some(reified) = self.get_thunk_cache(&key) {
+            if verify_reified_cached_effect_inputs(&reified)? {
+                materialize_reified_cached_effect_outputs(&reified)?;
+                trace.record(RuntimeTraceEvent::ThunkCacheHit { key });
+                return Ok(ForcedThunk::cacheable(reified.into_runtime()));
+            }
+            trace.record(RuntimeTraceEvent::ThunkCacheInvalidated { key });
         }
 
-        if let Some(reified) = self.load_cached_thunk_with_trace(&key, trace)?
-            && verify_reified_cached_effect_inputs(&reified)?
-        {
-            materialize_reified_cached_effect_outputs(&reified)?;
-            self.insert_thunk_cache(key, reified.clone());
-            trace.record(RuntimeTraceEvent::ThunkCacheHit { key });
-            return Ok(ForcedThunk::cacheable(reified.into_runtime()));
+        if let Some(reified) = self.load_cached_thunk_with_trace(&key, trace)? {
+            if verify_reified_cached_effect_inputs(&reified)? {
+                materialize_reified_cached_effect_outputs(&reified)?;
+                self.insert_thunk_cache(key, reified.clone());
+                trace.record(RuntimeTraceEvent::ThunkCacheHit { key });
+                return Ok(ForcedThunk::cacheable(reified.into_runtime()));
+            }
+            trace.record(RuntimeTraceEvent::ThunkCacheInvalidated { key });
         }
 
         let outcome = self.run_with_trace_sink(term, host, trace, cancellation)?;

@@ -321,8 +321,11 @@ fn print_trace_summary(summary: &RuntimeTraceSummary) {
         summary.task_starts, summary.task_ends
     );
     println!(
-        "- thunk cache: hits {}, stores {}, bypasses {}",
-        summary.thunk_cache_hits, summary.thunk_cache_stores, summary.thunk_cache_bypasses
+        "- thunk cache: hits {}, stores {}, bypasses {}, invalidations {}",
+        summary.thunk_cache_hits,
+        summary.thunk_cache_stores,
+        summary.thunk_cache_bypasses,
+        summary.thunk_cache_invalidations
     );
     println!(
         "- memo table: hits {}, stores {}",
