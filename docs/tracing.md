@@ -17,6 +17,8 @@ The trace output has three parts:
 - `eval start`: evaluation began for a term. Closed terms may include a digest.
 - `yield`: evaluation performed an effect.
 - `host handle`: the host handled an effect and shows its policy.
+- `host event`: a structured lifecycle event emitted by a host handler. The
+  event includes an op name, a phase, and fields.
 - `builtin handle`: the runtime handled a built-in effect.
 - `run complete`: a run finished with data, closure, continuation, or ref.
 
@@ -37,18 +39,20 @@ The policy shown on `host handle` explains most cache decisions. For example,
 `math.add [stable]` can participate in thunk caching, while `fs.write
 [volatile]` forces a bypass.
 
-## Service Events
+## Host Lifecycle Events
 
-Service supervision emits structured lifecycle events:
+Service supervision emits generic host lifecycle events instead of dedicated
+runtime service variants. In textual traces they look like:
 
-- `service spawn`
-- `service exit`
-- `service restart`
-- `service stop`
+- `host event: service.supervise spawn {...}`
+- `host event: service.supervise exit {...}`
+- `host event: service.supervise restart {...}`
+- `host event: service.supervise stop {...}`
 
 These make service behavior visible in the same trace stream as build-like
 cache behavior. That is the point of r2: builds and services are not separate
-worlds in the runtime.
+worlds in the runtime. The summary still reports service spawn/exit/restart/stop
+counts as a convenience projection over those generic events.
 
 ## Reading a Tiny Trace
 

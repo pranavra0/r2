@@ -6,8 +6,13 @@ that request to either a built-in handler or the host.
 
 ## Built-in vs Host Effects
 
-Built-in effects are part of the runtime. Today the main built-in is
-`thunk.force`, which implements lazy thunks and policy-aware caching.
+Built-in effects are part of the runtime. Today the main built-ins are:
+
+- `thunk.force`, which implements lazy thunks and policy-aware caching.
+- `thunk.force_all`, an internal batch form used to force independent thunk
+  frontiers.
+- `record.get`, a stable record accessor used by surface `x.y` sugar. It keeps
+  field access out of the IR and does not grant authority.
 
 Host effects are registered on `Host`:
 
@@ -21,6 +26,10 @@ Host effects are registered on `Host`:
 
 Each host handler receives evaluated runtime values, performs whatever outside
 work it owns, and resumes the captured continuation with a runtime value.
+Leaf host handlers live under `src/host/` when the split makes the capability
+easier to read. The process/cache/materialization path remains centralized in
+`host.rs` because those responsibilities share request parsing, provenance,
+output capture, and cache materialization helpers.
 
 ## Policy Quadrants
 
@@ -65,6 +74,8 @@ host.register_stable("math.add", |args, continuation| {
 
 The hermetic process handler hashes declared input contents into its cache key,
 stores result values, and re-materializes declared outputs on cache hits.
+Before spawning, r2 creates parent directories for declared outputs, so a clean
+workspace does not need pre-created output directories.
 
 With the `sandbox` Cargo feature enabled, r2 also applies a conservative
 declared-path guard before spawning. Stronger OS-level isolation is still future
@@ -78,5 +89,8 @@ work.
 restart_policy: { mode: "on_failure", max_restarts: 3, delay_nanos: 0 }
 ```
 
-It is volatile. It records service lifecycle trace events and returns
-`ok({ final_status, restart_count })` when the policy stops.
+It is volatile. It records generic host lifecycle trace events with
+`op = service.supervise` and phases `spawn`, `exit`, `restart`, and `stop`,
+then returns `ok({ final_status, restart_count })` when the policy stops.
+The handler is intentionally validation scaffolding over the process helpers,
+not a separate service subsystem.

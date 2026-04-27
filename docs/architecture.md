@@ -14,7 +14,7 @@ identity.
   -> data.rs Term/Value IR
   -> eval.rs pure evaluator
   -> runtime.rs driver, tracing, memo/thunk cache, cancellation
-  -> host.rs effect handlers
+  -> host.rs / host/* effect handlers
   -> store.rs content-addressed persistence
 ```
 
@@ -40,12 +40,24 @@ and `store gc`.
 `src/runtime.rs`
 : The orchestration layer. It repeatedly evaluates, handles built-ins, delegates
   host effects, records traces, manages memo/thunk caches, persists cacheable
-  thunk results, and honors cancellation tokens.
+  thunk results, and honors cancellation tokens. Runtime trace events should
+  stay semantic and generic. Host-specific lifecycle details flow through
+  generic `HostEvent` records rather than domain-specific runtime variants.
 
 `src/host.rs`
-: Default host effects: filesystem, clock, math, process spawn, and service
-  supervision. This is where outside-world behavior lives. Any cache-related
-  decision here must line up with a `HostEffectPolicy`.
+: Default host shell: handler registration, effect policy lookup, shared host
+  helpers, process spawning, hermetic process cache validation, declared
+  input/output materialization, and process-result shaping. This file is still
+  intentionally the home for the load-bearing process/cache logic because
+  those pieces are tightly coupled. Do not split process code merely to shrink
+  the file; split only when the boundary is obvious and reduces coupling.
+
+`src/host/*.rs`
+: Small host capability implementations that would otherwise add noise to
+  `host.rs`. `fs.rs`, `clock.rs`, and `math.rs` are leaf handlers.
+  `supervise.rs` is validation scaffolding for `service.supervise`; it calls
+  the shared process helpers rather than becoming a parallel service subsystem.
+  Keep `Host` as the public install/register surface.
 
 `src/store.rs`
 : Content-addressed object storage. `MemoryStore` is for tests and ephemeral
@@ -68,7 +80,7 @@ and `store gc`.
 
 `src/service.rs`
 : Service-oriented typed API and restart-policy logic. The actual supervisor
-  effect handler is in `host.rs`.
+  effect handler is in `host/supervise.rs`.
 
 `src/bin/r2.rs`
 : CLI plumbing. Keep policy and runtime semantics out of here where possible;
@@ -81,7 +93,8 @@ and `store gc`.
 2. `eval` returns either `Done(value)` or `Yielded(effect)`.
 3. The runtime records `yield`.
 4. Built-ins get first chance. Today the important built-ins are
-   `thunk.force` and the internal batch form `thunk.force_all`.
+   `thunk.force`, the internal batch form `thunk.force_all`, and the stable
+   record accessor `record.get` used by surface `x.y` sugar.
 5. Otherwise, the host handles the effect and returns the next `EvalResult`.
 6. The runtime records host policy and continues until `Done`.
 
@@ -131,7 +144,8 @@ For a surface-language feature:
 For a host effect:
 
 1. Add typed request/result helpers in `src/effects.rs` if useful.
-2. Register a handler in `src/host.rs`.
+2. Register a handler on `Host`; put leaf capability code under `src/host/`
+   when it keeps `host.rs` smaller without inventing a new subsystem.
 3. Pick the correct `HostEffectPolicy`.
 4. Add trace expectations if policy/caching behavior matters.
 5. Add CLI acceptance coverage if users can invoke it from `.r2`.
@@ -149,5 +163,8 @@ For runtime/store behavior:
 - Volatile effects must not silently enter the thunk cache.
 - Hermetic effects must include all meaningful inputs in their cache key.
 - Service supervision is volatile, even though it may spawn processes.
+- Service supervision emits generic host lifecycle trace events; the runtime
+  should not grow service-specific trace variants unless future evidence proves
+  they belong in core.
 - Cancellation should be checked at yield boundaries and inside long host loops.
 - Public acceptance tests live in `tests/`; private invariants can stay inline.
