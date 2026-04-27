@@ -16,6 +16,7 @@ use crate::store::{CachedThunk, MemoryStore, ObjectStore, StoreError, Stored};
 use crate::thunk::{self, ThunkError};
 
 const DEFAULT_CACHE_LIMIT: usize = 10_000;
+const RECORD_GET_OP: &str = "record.get";
 static NEXT_TASK_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug)]
@@ -27,6 +28,7 @@ pub enum RuntimeError {
     UnhandledEffect { op: Symbol },
     CachedOutputMaterialization { message: String },
     CacheInvalidation { message: String },
+    Builtin { op: Symbol, message: String },
     Cancelled,
 }
 
@@ -47,6 +49,7 @@ impl fmt::Display for RuntimeError {
                     "cached thunk invalidated due to changed inputs: {message}"
                 )
             }
+            Self::Builtin { op, message } => write!(f, "{op}: {message}"),
             Self::Cancelled => f.write_str("cancelled"),
         }
     }
@@ -176,19 +179,10 @@ pub enum RuntimeTraceEvent {
         op: Symbol,
         policy: HostEffectPolicy,
     },
-    ServiceSpawn {
-        iteration: u32,
-    },
-    ServiceExit {
-        iteration: u32,
-        status: Value,
-    },
-    ServiceRestart {
-        next_iteration: u32,
-    },
-    ServiceStop {
-        restart_count: u32,
-        final_status: Value,
+    HostEvent {
+        op: Symbol,
+        phase: Symbol,
+        fields: BTreeMap<Symbol, Value>,
     },
     UnhandledEffect {
         op: Symbol,
@@ -249,20 +243,9 @@ impl fmt::Display for RuntimeTraceEvent {
             Self::Yield { op } => write!(f, "yield: {op}"),
             Self::BuiltinHandle { op } => write!(f, "builtin handle: {op}"),
             Self::HostHandle { op, policy } => write!(f, "host handle: {op} [{policy}]"),
-            Self::ServiceSpawn { iteration } => write!(f, "service spawn: {iteration}"),
-            Self::ServiceExit { iteration, status } => {
-                write!(f, "service exit: {iteration} {status:?}")
+            Self::HostEvent { op, phase, fields } => {
+                write!(f, "host event: {op} {phase} {fields:?}")
             }
-            Self::ServiceRestart { next_iteration } => {
-                write!(f, "service restart: {next_iteration}")
-            }
-            Self::ServiceStop {
-                restart_count,
-                final_status,
-            } => write!(
-                f,
-                "service stop: restarts {restart_count}, final status {final_status:?}"
-            ),
             Self::UnhandledEffect { op } => write!(f, "unhandled effect: {op}"),
             Self::ThunkForce { key } => write!(f, "thunk force: {key}"),
             Self::ThunkForceAll { frontier_id, count } => {
@@ -359,10 +342,17 @@ impl RuntimeTrace {
                         }
                     }
                 }
-                RuntimeTraceEvent::ServiceSpawn { .. } => summary.service_spawns += 1,
-                RuntimeTraceEvent::ServiceExit { .. } => summary.service_exits += 1,
-                RuntimeTraceEvent::ServiceRestart { .. } => summary.service_restarts += 1,
-                RuntimeTraceEvent::ServiceStop { .. } => summary.service_stops += 1,
+                RuntimeTraceEvent::HostEvent { op, phase, .. } => {
+                    if op.as_str() == "service.supervise" {
+                        match phase.as_str() {
+                            "spawn" => summary.service_spawns += 1,
+                            "exit" => summary.service_exits += 1,
+                            "restart" => summary.service_restarts += 1,
+                            "stop" => summary.service_stops += 1,
+                            _ => {}
+                        }
+                    }
+                }
                 RuntimeTraceEvent::UnhandledEffect { .. } => summary.unhandled_effects += 1,
                 RuntimeTraceEvent::ThunkForce { .. } => summary.thunk_forces += 1,
                 RuntimeTraceEvent::ThunkForceAll { .. } => summary.thunk_force_all += 1,
@@ -1063,6 +1053,9 @@ impl<S: ObjectStore> Runtime<S> {
                 cancellation,
             )?));
         }
+        if yielded.op.as_str() == RECORD_GET_OP {
+            return Ok(Some(handle_record_get(yielded)?));
+        }
 
         Ok(None)
     }
@@ -1365,20 +1358,9 @@ impl<S: ObjectStore> Runtime<S> {
 impl From<HostTraceEvent> for RuntimeTraceEvent {
     fn from(value: HostTraceEvent) -> Self {
         match value {
-            HostTraceEvent::ServiceSpawn { iteration } => Self::ServiceSpawn { iteration },
-            HostTraceEvent::ServiceExit { iteration, status } => {
-                Self::ServiceExit { iteration, status }
+            HostTraceEvent::Lifecycle { op, phase, fields } => {
+                Self::HostEvent { op, phase, fields }
             }
-            HostTraceEvent::ServiceRestart { next_iteration } => {
-                Self::ServiceRestart { next_iteration }
-            }
-            HostTraceEvent::ServiceStop {
-                restart_count,
-                final_status,
-            } => Self::ServiceStop {
-                restart_count,
-                final_status,
-            },
         }
     }
 }
@@ -1436,6 +1418,52 @@ fn touch_access_order(order: &mut Vec<Digest>, digest: Digest) {
         order.remove(index);
     }
     order.push(digest);
+}
+
+fn handle_record_get(yielded: Yielded) -> Result<BuiltinOutcome, RuntimeError> {
+    let mut args = yielded.args.into_iter();
+    let record = args
+        .next()
+        .ok_or_else(|| record_get_error("expected a record and field name"))?;
+    let field = args
+        .next()
+        .ok_or_else(|| record_get_error("expected a record and field name"))?;
+    if args.next().is_some() {
+        return Err(record_get_error("expected exactly two arguments"));
+    }
+
+    let RuntimeValue::Data(Value::Record(record)) = record else {
+        return Err(record_get_error("first argument must be a record"));
+    };
+    let RuntimeValue::Data(Value::Bytes(field)) = field else {
+        return Err(record_get_error(
+            "second argument must be a bytes field name",
+        ));
+    };
+    let name =
+        String::from_utf8(field).map_err(|_| record_get_error("field name must be utf-8"))?;
+    let value = record
+        .get(&Symbol::from(name.as_str()))
+        .cloned()
+        .ok_or_else(|| record_get_error(format!("missing field `{name}`")))?;
+    let result = yielded
+        .continuation
+        .resume(RuntimeValue::Data(value))
+        .map_err(RuntimeError::from)?;
+
+    Ok(BuiltinOutcome {
+        result,
+        cacheable: true,
+        uncacheable_effect: None,
+        uncacheable_policy: None,
+    })
+}
+
+fn record_get_error(message: impl Into<String>) -> RuntimeError {
+    RuntimeError::Builtin {
+        op: Symbol::from(RECORD_GET_OP),
+        message: message.into(),
+    }
 }
 
 #[cfg(test)]

@@ -185,6 +185,10 @@ enum ExprKind {
         callee: Box<Expr>,
         args: Vec<Expr>,
     },
+    Field {
+        record: Box<Expr>,
+        name: String,
+    },
     Binary {
         op: BinaryOp,
         left: Box<Expr>,
@@ -985,21 +989,34 @@ impl<'a> Parser<'a> {
         let mut expr = self.parse_primary()?;
 
         loop {
-            if !matches!(self.peek().kind, TokenKind::LParen) {
-                return Ok(expr);
+            match self.peek().kind {
+                TokenKind::LParen => {
+                    self.next();
+                    let args = self.parse_expr_list(|kind| matches!(kind, TokenKind::RParen))?;
+                    let end = self.expect_token("`)`", |kind| matches!(kind, TokenKind::RParen))?;
+                    let span = expr.span.join(end);
+                    expr = Expr {
+                        kind: ExprKind::Call {
+                            callee: Box::new(expr),
+                            args,
+                        },
+                        span,
+                    };
+                }
+                TokenKind::Dot => {
+                    self.next();
+                    let (name, end) = self.expect_ident()?;
+                    let span = expr.span.join(end);
+                    expr = Expr {
+                        kind: ExprKind::Field {
+                            record: Box::new(expr),
+                            name,
+                        },
+                        span,
+                    };
+                }
+                _ => return Ok(expr),
             }
-
-            self.next();
-            let args = self.parse_expr_list(|kind| matches!(kind, TokenKind::RParen))?;
-            let end = self.expect_token("`)`", |kind| matches!(kind, TokenKind::RParen))?;
-            let span = expr.span.join(end);
-            expr = Expr {
-                kind: ExprKind::Call {
-                    callee: Box::new(expr),
-                    args,
-                },
-                span,
-            };
         }
     }
 
@@ -1305,6 +1322,13 @@ fn lower_expr(source: &str, expr: &Expr, env: &mut Vec<String>) -> Result<Term, 
                     .collect::<Result<Vec<_>, _>>()?,
             })
         }
+        ExprKind::Field { record, name } => Ok(Term::Perform {
+            op: Symbol::from("record.get"),
+            args: vec![
+                lower_expr(source, record, env)?,
+                Term::Value(Value::Bytes(name.as_bytes().to_vec())),
+            ],
+        }),
         ExprKind::Binary { op, left, right } => Ok(Term::Perform {
             op: op.effect_op(),
             args: vec![
@@ -1621,6 +1645,7 @@ fn literal_restriction_name(expr: &Expr) -> &'static str {
         ExprKind::LetRec { .. } => "a recursive let expression",
         ExprKind::Lambda { .. } => "a function",
         ExprKind::Call { .. } => "a function call",
+        ExprKind::Field { .. } => "a record field access",
         ExprKind::Binary { .. } => "an operator expression",
         ExprKind::Perform { .. } => "an effect request",
         ExprKind::Handle { .. } => "a handler block",
@@ -1726,5 +1751,16 @@ mod tests {
         let term = parse("let x = 5; { value: x }").expect("record should parse");
 
         assert!(matches!(term, Term::Apply { args: _, callee: _ }));
+    }
+
+    #[test]
+    fn dot_access_lowers_to_record_get() {
+        let term =
+            parse("let response = { status: :ok, nested: { value: 42 } }; response.nested.value")
+                .expect("field access should parse");
+        let mut runtime = crate::runtime::Runtime::new();
+        let result = runtime.run(term, &mut ()).expect("field access should run");
+
+        assert!(matches!(result, RuntimeValue::Data(Value::Integer(42))));
     }
 }
