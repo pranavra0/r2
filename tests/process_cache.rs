@@ -1,8 +1,12 @@
+#[cfg(unix)]
 use std::collections::BTreeMap;
+#[cfg(unix)]
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use r2::{Host, Runtime, RuntimeValue, Symbol, Term, Value};
+#[cfg(unix)]
+use r2::{Host, Runtime, RuntimeValue, Symbol, Term, Value, thunk};
 
 #[cfg(unix)]
 #[test]
@@ -201,6 +205,61 @@ fn process_request_with_script(input: &Path, output: &Path, marker: &Path, scrip
             ),
         ])))],
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn hermetic_process_spawn_thunk_cache_invalidates_when_input_changes() {
+    let input_path = unique_temp_path("r2-thunk-invalidation-input", "txt");
+    let output_path = unique_temp_path("r2-thunk-invalidation-output", "txt");
+    let marker_path = unique_temp_path("r2-thunk-invalidation-marker", "txt");
+    std::fs::write(&input_path, "v1").expect("input should write");
+
+    let mut runtime = Runtime::new();
+    let mut host = Host::new();
+    host.install_hermetic_process_spawn();
+
+    let spawn_term = process_request_with_script(
+        &input_path,
+        &output_path,
+        &marker_path,
+        r#"cat "$1" > "$2"; printf 'run\n' >> "$3""#,
+    );
+    let program = thunk::force(thunk::delay(spawn_term));
+
+    let first = runtime
+        .run(program.clone(), &mut host)
+        .expect("first run should execute");
+    assert_ok_result(first);
+    assert_eq!(std::fs::read_to_string(&output_path).unwrap(), "v1");
+    assert_eq!(std::fs::read_to_string(&marker_path).unwrap(), "run\n");
+
+    let second = runtime
+        .run(program.clone(), &mut host)
+        .expect("second run should hit thunk cache");
+    assert_ok_result(second);
+    assert_eq!(
+        std::fs::read_to_string(&marker_path).unwrap(),
+        "run\n",
+        "warm thunk cache should not re-execute process"
+    );
+
+    std::fs::write(&input_path, "v2").expect("input should update");
+
+    let third = runtime
+        .run(program, &mut host)
+        .expect("third run should invalidate thunk cache");
+    assert_ok_result(third);
+    assert_eq!(std::fs::read_to_string(&output_path).unwrap(), "v2");
+    assert_eq!(
+        std::fs::read_to_string(&marker_path).unwrap(),
+        "run\nrun\n",
+        "changed input should invalidate thunk cache and re-execute process"
+    );
+
+    let _ = std::fs::remove_file(input_path);
+    let _ = std::fs::remove_file(output_path);
+    let _ = std::fs::remove_file(marker_path);
 }
 
 #[cfg(unix)]

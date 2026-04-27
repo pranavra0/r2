@@ -10,7 +10,7 @@ use crate::data::{Digest, Ref, Symbol, Term, Value};
 use crate::eval::{Continuation, EvalError, EvalResult, Reified, RuntimeValue, Yielded, eval};
 use crate::host::{
     HostEffectCaching, HostEffectPolicy, HostEffectProvenance, HostError, HostHandler,
-    HostTraceEvent, materialize_cached_effect_outputs,
+    HostTraceEvent, materialize_cached_effect_outputs, verify_cached_effect_inputs,
 };
 use crate::store::{CachedThunk, MemoryStore, ObjectStore, StoreError, Stored};
 use crate::thunk::{self, ThunkError};
@@ -26,6 +26,7 @@ pub enum RuntimeError {
     Thunk(ThunkError),
     UnhandledEffect { op: Symbol },
     CachedOutputMaterialization { message: String },
+    CacheInvalidation { message: String },
     Cancelled,
 }
 
@@ -39,6 +40,9 @@ impl fmt::Display for RuntimeError {
             Self::UnhandledEffect { op } => write!(f, "unhandled effect {op}"),
             Self::CachedOutputMaterialization { message } => {
                 write!(f, "cached output materialization failed: {message}")
+            }
+            Self::CacheInvalidation { message } => {
+                write!(f, "cached thunk invalidated due to changed inputs: {message}")
             }
             Self::Cancelled => f.write_str("cancelled"),
         }
@@ -1250,13 +1254,17 @@ impl<S: ObjectStore> Runtime<S> {
         cancellation.check()?;
         trace.record(RuntimeTraceEvent::ThunkForce { key });
 
-        if let Some(reified) = self.get_thunk_cache(&key) {
+        if let Some(reified) = self.get_thunk_cache(&key)
+            && verify_reified_cached_effect_inputs(&reified)?
+        {
             materialize_reified_cached_effect_outputs(&reified)?;
             trace.record(RuntimeTraceEvent::ThunkCacheHit { key });
             return Ok(ForcedThunk::cacheable(reified.into_runtime()));
         }
 
-        if let Some(reified) = self.load_cached_thunk_with_trace(&key, trace)? {
+        if let Some(reified) = self.load_cached_thunk_with_trace(&key, trace)?
+            && verify_reified_cached_effect_inputs(&reified)?
+        {
             materialize_reified_cached_effect_outputs(&reified)?;
             self.insert_thunk_cache(key, reified.clone());
             trace.record(RuntimeTraceEvent::ThunkCacheHit { key });
@@ -1388,6 +1396,15 @@ fn materialize_reified_cached_effect_outputs(reified: &Reified) -> Result<(), Ru
 
     materialize_cached_effect_outputs(value)
         .map_err(|message| RuntimeError::CachedOutputMaterialization { message })
+}
+
+fn verify_reified_cached_effect_inputs(reified: &Reified) -> Result<bool, RuntimeError> {
+    let Reified::Value(value) = reified else {
+        return Ok(true);
+    };
+
+    verify_cached_effect_inputs(value)
+        .map_err(|message| RuntimeError::CacheInvalidation { message })
 }
 
 impl Stored {

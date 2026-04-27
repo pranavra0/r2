@@ -140,7 +140,7 @@ fn process_spawn_materializes_declared_outputs() {
     assert!(stdout.contains("output_files"), "{stdout}");
     assert!(stdout.contains("hello from child"), "{stdout}");
     assert!(
-        stdout.contains(output_path.to_string_lossy().as_ref()),
+        stdout.contains(&string_literal(output_path.to_string_lossy().as_ref())),
         "{stdout}"
     );
 
@@ -456,6 +456,67 @@ fn build_demo_cli_cold_and_warm_runs_materialize_outputs() {
     );
     assert_build_demo_binary_runs();
 
+    let _ = std::fs::remove_dir_all(store_path);
+    clean_build_demo_outputs();
+}
+
+#[cfg(unix)]
+#[test]
+fn build_demo_cli_incremental_rebuilds_only_changed_source() {
+    if command_path("cc").is_none() {
+        eprintln!("skipping build demo incremental because no cc was found");
+        return;
+    }
+
+    let store_path = unique_temp_dir("r2-cli-build-demo-incremental-store");
+    clean_build_demo_outputs();
+
+    let first = Command::new(env!("CARGO_BIN_EXE_r2"))
+        .arg("trace")
+        .arg("--summary")
+        .arg("--store")
+        .arg(&store_path)
+        .arg("examples/build-demo/build.r2")
+        .output()
+        .expect("cold build demo should run");
+
+    assert!(first.status.success(), "stderr: {}", stderr(&first));
+    assert_build_demo_binary_runs();
+
+    let one_c_path = std::path::PathBuf::from("examples/build-demo/src/one.c");
+    let original_one_c = std::fs::read_to_string(&one_c_path).unwrap();
+    std::fs::write(&one_c_path, "int one(void) { return 100; }\n").unwrap();
+
+    clean_build_demo_outputs();
+
+    let second = Command::new(env!("CARGO_BIN_EXE_r2"))
+        .arg("trace")
+        .arg("--summary")
+        .arg("--store")
+        .arg(&store_path)
+        .arg("examples/build-demo/build.r2")
+        .output()
+        .expect("incremental build demo should run");
+
+    assert!(second.status.success(), "stderr: {}", stderr(&second));
+    let second_stdout = String::from_utf8(second.stdout).unwrap();
+    assert!(second_stdout.contains("result: ok({"), "{second_stdout}");
+    assert!(
+        second_stdout.contains("- thunk cache: hits 4, stores 2, bypasses 0"),
+        "{second_stdout}"
+    );
+    assert!(
+        second_stdout.contains("host handle: process.spawn [hermetic]"),
+        "{second_stdout}"
+    );
+
+    let output = Command::new(build_demo_binary_path())
+        .output()
+        .expect("build demo binary should run");
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), "109\n");
+
+    std::fs::write(&one_c_path, original_one_c).unwrap();
     let _ = std::fs::remove_dir_all(store_path);
     clean_build_demo_outputs();
 }

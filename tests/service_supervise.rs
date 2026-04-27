@@ -1,9 +1,15 @@
+#[cfg(unix)]
 use std::collections::BTreeMap;
+#[cfg(unix)]
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::process::{Command, Stdio};
+#[cfg(unix)]
 use std::time::{Duration, Instant};
+#[cfg(unix)]
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(unix)]
 use r2::{Host, Runtime, RuntimeTraceEvent, RuntimeValue, Symbol, Term, Value};
 
 #[cfg(unix)]

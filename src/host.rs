@@ -168,6 +168,48 @@ pub(crate) fn materialize_cached_effect_outputs(value: &Value) -> Result<(), Str
     materialize_cached_outputs(value)
 }
 
+pub(crate) fn verify_cached_effect_inputs(value: &Value) -> Result<bool, String> {
+    let Value::Tagged { tag, fields } = value else {
+        return Ok(true);
+    };
+    if *tag != Symbol::from("ok") {
+        return Ok(true);
+    }
+    let [Value::Record(record)] = fields.as_slice() else {
+        return Ok(true);
+    };
+    let Some(Value::Bytes(stored_digest_bytes)) = record.get(&Symbol::from("input_digest")) else {
+        return Ok(true);
+    };
+    let stored_digest = Digest::new(
+        stored_digest_bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| "invalid input_digest length".to_string())?,
+    );
+
+    let Value::List(declared_inputs) =
+        required_record_field(record, "declared_inputs", PROCESS_SPAWN_OP)?
+    else {
+        return Err("process.spawn result declared_inputs must be a list".to_string());
+    };
+    let paths = declared_inputs
+        .iter()
+        .map(|v| match v {
+            Value::Bytes(bytes) => Ok(bytes.clone()),
+            _ => Err("declared_inputs must contain bytes".to_string()),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let current_inputs_value = match declared_input_files_cache_value(&paths) {
+        Ok(value) => value,
+        Err(_) => return Ok(false),
+    };
+    let current_digest = current_inputs_value.digest();
+
+    Ok(current_digest == stored_digest)
+}
+
 struct RegisteredHandler {
     handler: Box<Handler>,
     concurrent_handler: Option<Arc<ConcurrentHandler>>,
@@ -763,7 +805,9 @@ fn run_hermetic_process_request(
 
     enforce_process_sandbox(&request)?;
     let output = execute_process(&request, cancellation)?;
-    let value = process_result_value(request, output);
+    let declared_inputs_value = declared_input_files_cache_value(&request.declared_inputs)?;
+    let input_digest = declared_inputs_value.digest();
+    let value = hermetic_process_result_value(request, output, input_digest);
     if declared_outputs_complete(&value) {
         cache
             .lock()
@@ -1092,6 +1136,23 @@ fn process_result_value(request: ProcessSpawnRequest, output: std::process::Outp
         tag: Symbol::from("ok"),
         fields: vec![Value::Record(record)],
     }
+}
+
+fn hermetic_process_result_value(
+    request: ProcessSpawnRequest,
+    output: std::process::Output,
+    input_digest: Digest,
+) -> Value {
+    let mut value = process_result_value(request, output);
+    if let Value::Tagged { tag: _, fields } = &mut value
+        && let [Value::Record(record)] = fields.as_mut_slice()
+    {
+        record.insert(
+            Symbol::from("input_digest"),
+            Value::Bytes(input_digest.as_bytes().to_vec()),
+        );
+    }
+    value
 }
 
 fn validate_declared_inputs(request: &ProcessSpawnRequest) -> Result<(), String> {
