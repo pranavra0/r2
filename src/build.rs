@@ -24,6 +24,10 @@ impl Artifact {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// Typed helper for constructing a `process.spawn` request.
+///
+/// `Action` is deliberately just a Rust-side convenience for producing the
+/// same effect record an r2 program can write by hand.
 pub struct Action {
     argv: Vec<Vec<u8>>,
     env_mode: process::EnvMode,
@@ -161,6 +165,11 @@ impl fmt::Display for GraphError {
 impl std::error::Error for GraphError {}
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// Tooling view over a build DAG.
+///
+/// `Graph` is useful for Rust-side demos, dependency inspection, and DOT
+/// rendering, but it is not a separate build semantic. Executing a graph means
+/// projecting it into ordinary r2 expressions made from thunks and effects.
 pub struct Graph {
     nodes: Vec<GraphNode>,
     artifact_producers: BTreeMap<Vec<u8>, Handle>,
@@ -271,7 +280,7 @@ impl Graph {
         Ok(layers)
     }
 
-    pub fn to_term(&self) -> Result<Term, GraphError> {
+    pub fn to_expression(&self) -> Result<Term, GraphError> {
         for handle in self.targets.values() {
             self.require_acyclic(*handle)?;
         }
@@ -283,9 +292,17 @@ impl Graph {
         Ok(Term::Record(
             self.targets
                 .iter()
-                .map(|(name, handle)| (name.clone(), self.term_for_handle(*handle)))
+                .map(|(name, handle)| (name.clone(), self.expression_for_handle(*handle)))
                 .collect(),
         ))
+    }
+
+    /// Compatibility alias for callers that still use the older lowering name.
+    ///
+    /// Prefer [`Graph::to_expression`] in new code so `Graph` remains framed as
+    /// tooling that projects into the source language, not a runtime substrate.
+    pub fn to_term(&self) -> Result<Term, GraphError> {
+        self.to_expression()
     }
 
     pub fn render_dot(&self) -> String {
@@ -413,14 +430,14 @@ impl Graph {
         self.visit_topological(handle, &mut temporary, &mut permanent, &mut order)
     }
 
-    fn term_for_handle(&self, handle: Handle) -> Term {
+    fn expression_for_handle(&self, handle: Handle) -> Term {
         match &self.nodes[handle.0] {
             GraphNode::Input { artifact } => Term::Value(Value::Bytes(artifact.path().to_vec())),
-            GraphNode::Action { .. } => thunk::force(self.thunk_for_handle(handle)),
+            GraphNode::Action { .. } => thunk::force(self.thunk_expression_for_handle(handle)),
         }
     }
 
-    fn thunk_for_handle(&self, handle: Handle) -> Term {
+    fn thunk_expression_for_handle(&self, handle: Handle) -> Term {
         match &self.nodes[handle.0] {
             GraphNode::Input { artifact } => {
                 thunk::delay(Term::Value(Value::Bytes(artifact.path().to_vec())))
@@ -433,7 +450,9 @@ impl Graph {
                     .iter()
                     .filter_map(|dependency| match &self.nodes[dependency.0] {
                         GraphNode::Input { .. } => None,
-                        GraphNode::Action { .. } => Some(self.thunk_for_handle(*dependency)),
+                        GraphNode::Action { .. } => {
+                            Some(self.thunk_expression_for_handle(*dependency))
+                        }
                     })
                     .collect::<Vec<_>>();
                 let prerequisites = if dependency_thunks.is_empty() {
@@ -705,6 +724,27 @@ mod tests {
         assert_eq!(
             request.declared_outputs,
             vec![b"/out/artifact.txt".to_vec()]
+        );
+    }
+
+    #[test]
+    fn graph_projects_to_plain_r2_expression() {
+        let mut graph = Graph::new();
+        let action = Action::new(vec![b"/bin/true".to_vec()])
+            .output(Artifact::new(b"/tmp/out.txt".to_vec()));
+        let handle = graph.action(action.clone());
+        graph.target("out", handle).expect("target should register");
+
+        let expression = graph
+            .to_expression()
+            .expect("graph should project to an expression");
+
+        assert_eq!(
+            expression,
+            Term::Record(BTreeMap::from([(
+                Symbol::from("out"),
+                thunk::force(thunk::delay(action.into_term())),
+            )]))
         );
     }
 

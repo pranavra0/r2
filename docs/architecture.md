@@ -75,8 +75,11 @@ and `store gc`.
 
 `src/build.rs`
 : Build-oriented typed API over `process.spawn`. `Action` models one process
-  step, while `Graph` adds DAG authoring, target naming, dependency
-  introspection, DOT rendering, and lowering to ordinary thunked r2 `Term`s.
+  step, while `Graph` adds target naming, dependency introspection, DOT
+  rendering, and `to_expression()` projection into ordinary thunked r2 `Term`s.
+  `Graph` is tooling and test/demo infrastructure, not the semantic source of
+  truth for builds. Source programs should remain ordinary expressions whose
+  DAGs are derived from thunks, effects, refs, and provenance.
 
 `src/service.rs`
 : Service-oriented typed API and restart-policy logic. The actual supervisor
@@ -156,6 +159,14 @@ For runtime/store behavior:
 2. Add integration/CLI tests when behavior is visible outside the module.
 3. Check persistent-store behavior, not just `MemoryStore`.
 
+For CLI integration tests:
+
+1. Keep `tests/cli.rs` for broad command/effect smoke tests.
+2. Put tracing behavior in `tests/trace_cli.rs`, persistent store behavior in
+   `tests/store_cli.rs`, and build-demo acceptance in `tests/build_demo_cli.rs`.
+3. Put shared test plumbing in `tests/support/`; avoid adding demo-specific
+   fixtures back into the generic CLI bucket.
+
 ## Design Invariants
 
 - The store accepts only closed terms.
@@ -166,5 +177,8 @@ For runtime/store behavior:
 - Service supervision emits generic host lifecycle trace events; the runtime
   should not grow service-specific trace variants unless future evidence proves
   they belong in core.
+- Build graphs are derived views over expression evaluation. Keep `build::Graph`
+  useful for tooling, DOT output, and Rust-side demos, but do not make it the
+  privileged authoring path for source programs.
 - Cancellation should be checked at yield boundaries and inside long host loops.
 - Public acceptance tests live in `tests/`; private invariants can stay inline.

@@ -93,8 +93,11 @@ fn build_graph_compiles_and_links_a_small_c_project() {
     let mut host = Host::new();
     host.install_hermetic_process_spawn();
     let traced = runtime
-        .run_with_trace(graph.to_term().expect("graph should lower"), &mut host)
-        .expect("graph term should run");
+        .run_with_trace(
+            graph.to_expression().expect("graph should project"),
+            &mut host,
+        )
+        .expect("graph expression should run");
     assert_eq!(traced.trace.summary().thunk_force_all, 1);
 
     assert_target_succeeded(traced.value);
@@ -151,8 +154,11 @@ fn independent_slow_graph_actions_capture_current_sequential_baseline() {
     host.install_hermetic_process_spawn();
     let started = Instant::now();
     let result = runtime
-        .run(graph.to_term().expect("graph should lower"), &mut host)
-        .expect("graph term should run");
+        .run(
+            graph.to_expression().expect("graph should project"),
+            &mut host,
+        )
+        .expect("graph expression should run");
     let elapsed = started.elapsed();
 
     let RuntimeValue::Data(Value::Record(targets)) = result else {
@@ -222,8 +228,11 @@ fn dependent_slow_graph_frontier_runs_in_parallel() {
     host.install_hermetic_process_spawn();
     let started = Instant::now();
     let traced = runtime
-        .run_with_trace(graph.to_term().expect("graph should lower"), &mut host)
-        .expect("graph term should run");
+        .run_with_trace(
+            graph.to_expression().expect("graph should project"),
+            &mut host,
+        )
+        .expect("graph expression should run");
     let elapsed = started.elapsed();
 
     let RuntimeValue::Data(Value::Record(targets)) = traced.value else {
