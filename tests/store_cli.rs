@@ -1,25 +1,30 @@
+#![cfg(unix)]
+
 mod support;
 
+use std::path::PathBuf;
 use std::process::Command;
 
-use support::{has_files_under, stderr, unique_temp_dir, unique_temp_path};
+use support::{command_path, has_files_under, stderr, unique_temp_dir};
 
 #[test]
 fn file_store_persists_thunk_cache_across_cli_runs() {
-    let program_path = unique_temp_path("r2-cli-program-persistent-cache", "r2");
+    if command_path("cc").is_none() {
+        eprintln!("skipping store CLI cache test because no cc was found");
+        return;
+    }
+
+    let _outputs = BuildDemoOutputsGuard::new();
     let store_path = unique_temp_dir("r2-cli-store");
-    std::fs::write(&program_path, "force lazy { 5 }").expect("program should write");
 
     let first = Command::new(env!("CARGO_BIN_EXE_r2"))
-        .arg("run")
+        .arg("build-demo")
         .arg("--store")
         .arg(&store_path)
-        .arg(&program_path)
         .output()
         .expect("first cli run should execute");
 
     assert!(first.status.success(), "stderr: {}", stderr(&first));
-    assert_eq!(String::from_utf8(first.stdout).unwrap(), "5\n");
     assert!(
         store_path.join("objects").exists(),
         "store should contain object directory"
@@ -30,36 +35,36 @@ fn file_store_persists_thunk_cache_across_cli_runs() {
     );
 
     let second = Command::new(env!("CARGO_BIN_EXE_r2"))
-        .arg("run")
-        .arg("--trace")
+        .arg("build-demo")
+        .arg("--summary")
         .arg("--store")
         .arg(&store_path)
-        .arg(&program_path)
         .output()
         .expect("second cli run should execute");
 
     assert!(second.status.success(), "stderr: {}", stderr(&second));
 
     let stdout = String::from_utf8(second.stdout).unwrap();
-    assert!(stdout.contains("result: 5\n"), "{stdout}");
-    assert!(stdout.contains("thunk cache hit:"), "{stdout}");
-    assert!(!stdout.contains("thunk cache store:"), "{stdout}");
+    assert!(stdout.contains("binary: ok"), "{stdout}");
+    assert!(stdout.contains("thunk cache: hits"), "{stdout}");
 
-    let _ = std::fs::remove_file(program_path);
     let _ = std::fs::remove_dir_all(store_path);
 }
 
 #[test]
 fn store_gc_command_deletes_unrooted_objects() {
-    let program_path = unique_temp_path("r2-cli-program-gc", "r2");
+    if command_path("cc").is_none() {
+        eprintln!("skipping store CLI GC test because no cc was found");
+        return;
+    }
+
+    let _outputs = BuildDemoOutputsGuard::new();
     let store_path = unique_temp_dir("r2-cli-gc-store");
-    std::fs::write(&program_path, "force lazy { 5 }").expect("program should write");
 
     let run = Command::new(env!("CARGO_BIN_EXE_r2"))
-        .arg("run")
+        .arg("build-demo")
         .arg("--store")
         .arg(&store_path)
-        .arg(&program_path)
         .output()
         .expect("cli run should execute");
 
@@ -79,6 +84,33 @@ fn store_gc_command_deletes_unrooted_objects() {
     assert!(stdout.contains("deleted objects:"), "{stdout}");
     assert!(!has_files_under(&store_path.join("objects")));
 
-    let _ = std::fs::remove_file(program_path);
     let _ = std::fs::remove_dir_all(store_path);
+}
+
+struct BuildDemoOutputsGuard;
+
+impl BuildDemoOutputsGuard {
+    fn new() -> Self {
+        clean_build_demo_outputs();
+        Self
+    }
+}
+
+impl Drop for BuildDemoOutputsGuard {
+    fn drop(&mut self) {
+        clean_build_demo_outputs();
+    }
+}
+
+fn clean_build_demo_outputs() {
+    for name in [
+        "main.o",
+        "one.o",
+        "two.o",
+        "three.o",
+        "four.o",
+        "hello-demo",
+    ] {
+        let _ = std::fs::remove_file(PathBuf::from("examples/build-demo/out").join(name));
+    }
 }

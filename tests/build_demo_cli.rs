@@ -19,23 +19,25 @@ fn build_demo_cli_cold_and_warm_runs_materialize_outputs() {
     let store_path = unique_temp_dir("r2-cli-build-demo-store");
 
     let first = Command::new(env!("CARGO_BIN_EXE_r2"))
-        .arg("trace")
+        .arg("build-demo")
         .arg("--summary")
         .arg("--store")
         .arg(&store_path)
-        .arg("examples/build-demo/build.r2")
         .output()
         .expect("cold build demo should run");
 
     assert!(first.status.success(), "stderr: {}", stderr(&first));
     let first_stdout = String::from_utf8(first.stdout).unwrap();
-    assert!(first_stdout.contains("result: ok({"), "{first_stdout}");
+    assert!(
+        first_stdout.contains("result: {binary: ok({"),
+        "{first_stdout}"
+    );
     assert!(
         first_stdout.contains("- tasks: starts 5, ends 5"),
         "{first_stdout}"
     );
     assert!(
-        first_stdout.contains("- thunk cache: hits 0, stores "),
+        first_stdout.contains("- thunk cache: hits 0, stores 11, bypasses 0, invalidations 0"),
         "{first_stdout}"
     );
     assert!(
@@ -51,19 +53,21 @@ fn build_demo_cli_cold_and_warm_runs_materialize_outputs() {
     );
 
     let second = Command::new(env!("CARGO_BIN_EXE_r2"))
-        .arg("trace")
+        .arg("build-demo")
         .arg("--summary")
         .arg("--store")
         .arg(&store_path)
-        .arg("examples/build-demo/build.r2")
         .output()
         .expect("warm build demo should run");
 
     assert!(second.status.success(), "stderr: {}", stderr(&second));
     let second_stdout = String::from_utf8(second.stdout).unwrap();
-    assert!(second_stdout.contains("result: ok({"), "{second_stdout}");
     assert!(
-        second_stdout.contains("- thunk cache: hits 6, stores 0, bypasses 0, invalidations 0"),
+        second_stdout.contains("result: {binary: ok({"),
+        "{second_stdout}"
+    );
+    assert!(
+        second_stdout.contains("- thunk cache: hits 5, stores 1, bypasses 0, invalidations 1"),
         "{second_stdout}"
     );
     assert!(
@@ -71,7 +75,14 @@ fn build_demo_cli_cold_and_warm_runs_materialize_outputs() {
         "{second_stdout}"
     );
     assert!(
-        !second_stdout.contains("host handle: process.spawn [hermetic]"),
+        second_stdout.contains("host handle: process.spawn [hermetic]"),
+        "{second_stdout}"
+    );
+    assert_eq!(
+        second_stdout
+            .matches("host handle: process.spawn [hermetic]")
+            .count(),
+        1,
         "{second_stdout}"
     );
     assert_build_demo_binary_runs("10\n");
@@ -91,11 +102,10 @@ fn build_demo_cli_incremental_rebuilds_only_changed_source() {
     let store_path = unique_temp_dir("r2-cli-build-demo-incremental-store");
 
     let first = Command::new(env!("CARGO_BIN_EXE_r2"))
-        .arg("trace")
+        .arg("build-demo")
         .arg("--summary")
         .arg("--store")
         .arg(&store_path)
-        .arg("examples/build-demo/build.r2")
         .output()
         .expect("cold build demo should run");
 
@@ -108,19 +118,21 @@ fn build_demo_cli_incremental_rebuilds_only_changed_source() {
     clean_build_demo_outputs();
 
     let second = Command::new(env!("CARGO_BIN_EXE_r2"))
-        .arg("trace")
+        .arg("build-demo")
         .arg("--summary")
         .arg("--store")
         .arg(&store_path)
-        .arg("examples/build-demo/build.r2")
         .output()
         .expect("incremental build demo should run");
 
     assert!(second.status.success(), "stderr: {}", stderr(&second));
     let second_stdout = String::from_utf8(second.stdout).unwrap();
-    assert!(second_stdout.contains("result: ok({"), "{second_stdout}");
     assert!(
-        second_stdout.contains("- thunk cache: hits 4, stores 3, bypasses 0"),
+        second_stdout.contains("result: {binary: ok({"),
+        "{second_stdout}"
+    );
+    assert!(
+        second_stdout.contains("- thunk cache: hits 4, stores 3, bypasses 0, invalidations 3"),
         "{second_stdout}"
     );
     assert!(

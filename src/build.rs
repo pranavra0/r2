@@ -27,7 +27,7 @@ impl Artifact {
 /// Typed helper for constructing a `process.spawn` request.
 ///
 /// `Action` is deliberately just a Rust-side convenience for producing the
-/// same effect record an r2 program can write by hand.
+/// same runtime effect record that lower-level callers can construct directly.
 pub struct Action {
     argv: Vec<Vec<u8>>,
     env_mode: process::EnvMode,
@@ -299,8 +299,8 @@ impl Graph {
 
     /// Compatibility alias for callers that still use the older lowering name.
     ///
-    /// Prefer [`Graph::to_expression`] in new code so `Graph` remains framed as
-    /// tooling that projects into the source language, not a runtime substrate.
+    /// Prefer [`Graph::to_expression`] in new code so `Graph` remains framed
+    /// as runtime-oriented projection rather than parser-era lowering.
     pub fn to_term(&self) -> Result<Term, GraphError> {
         self.to_expression()
     }

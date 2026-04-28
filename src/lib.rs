@@ -6,7 +6,6 @@ pub mod host;
 pub mod runtime;
 pub mod service;
 pub mod store;
-pub mod syntax;
 pub mod thunk;
 
 pub use build::{
@@ -33,5 +32,4 @@ pub use service::{
     RestartDecision, RestartDelay, RestartMode, RestartPolicy, Service, ServiceSpec,
 };
 pub use store::{CachedThunk, FileStore, GcReport, MemoryStore, ObjectStore, StoreError, Stored};
-pub use syntax::{SyntaxError, parse as parse_program};
 pub use thunk::{ThunkError, delay, force};

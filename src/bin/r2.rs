@@ -1,13 +1,12 @@
 use std::env;
-use std::fs;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::str::FromStr;
 use std::sync::OnceLock;
 
 use r2::{
-    CancellationToken, Digest, FileStore, Host, ObjectStore, Ref, Reified, Runtime, RuntimeTrace,
-    RuntimeTraceSummary, RuntimeValue, TracedRun, Value, parse_program,
+    BuildAction, BuildArtifact, BuildGraph, CancellationToken, Digest, FileStore, Host, Ref,
+    Reified, Runtime, RuntimeTrace, RuntimeTraceSummary, RuntimeValue, TracedRun, Value,
 };
 
 static CURRENT_CANCELLATION: OnceLock<CancellationToken> = OnceLock::new();
@@ -25,8 +24,7 @@ fn main() -> ExitCode {
 fn run() -> Result<(), String> {
     let mut args = env::args().skip(1);
     match args.next().as_deref() {
-        Some("run") => run_file(args, false),
-        Some("trace") => run_file(args, true),
+        Some("build-demo") => run_build_demo(args),
         Some("store") => run_store(args),
         Some("--help") | Some("-h") => {
             println!("{}", usage());
@@ -38,7 +36,126 @@ fn run() -> Result<(), String> {
 }
 
 fn usage() -> &'static str {
-    "Usage: r2 run [--trace] [--summary] [--store <path>|--memory-store] <file>\n       r2 trace [--summary] [--store <path>|--memory-store] <file>\n       r2 store gc [--store <path>] [--root <hash>]...\n       r2 --help\n\nStore defaults to $XDG_STATE_HOME/r2/store on Unix, %LOCALAPPDATA%\\r2\\store on Windows, or .r2-store."
+    "Usage: r2 build-demo [--summary] [--store <path>|--memory-store]\n       r2 store gc [--store <path>] [--root <hash>]...\n       r2 --help\n\nStore defaults to $XDG_STATE_HOME/r2/store on Unix, %LOCALAPPDATA%\\r2\\store on Windows, or .r2-store."
+}
+
+fn run_build_demo(args: impl Iterator<Item = String>) -> Result<(), String> {
+    let mut summary_requested = false;
+    let mut store_path = None;
+    let mut memory_store = false;
+
+    let mut args = args.peekable();
+    while let Some(arg) = args.next() {
+        if arg == "--summary" {
+            summary_requested = true;
+            continue;
+        }
+
+        if arg == "--memory-store" {
+            memory_store = true;
+            continue;
+        }
+
+        if arg == "--store" {
+            let Some(value) = args.next() else {
+                return Err(format!("expected path after --store\n\n{}", usage()));
+            };
+            store_path = Some(PathBuf::from(value));
+            continue;
+        }
+
+        if let Some(value) = arg.strip_prefix("--store=") {
+            if value.is_empty() {
+                return Err(format!("expected path after --store=\n\n{}", usage()));
+            }
+            store_path = Some(PathBuf::from(value));
+            continue;
+        }
+
+        if arg.starts_with("--") {
+            return Err(format!("unknown flag `{arg}`\n\n{}", usage()));
+        }
+
+        return Err(format!("unexpected argument `{arg}`\n\n{}", usage()));
+    }
+
+    if memory_store && store_path.is_some() {
+        return Err(format!(
+            "--store and --memory-store cannot be used together\n\n{}",
+            usage()
+        ));
+    }
+
+    let cc = find_cc().ok_or("no C compiler found (tried $CC, cc, gcc)")?;
+    let src_dir = PathBuf::from("examples/build-demo/src");
+    let out_dir = PathBuf::from("examples/build-demo/out");
+
+    std::fs::create_dir_all(&out_dir)
+        .map_err(|e| format!("failed to create output directory: {e}"))?;
+
+    let mut graph = BuildGraph::new();
+    let sources = ["main.c", "one.c", "two.c", "three.c", "four.c"];
+
+    for source_name in &sources {
+        let source = src_dir.join(source_name);
+        let object = out_dir.join(source_name.replace(".c", ".o"));
+        graph.input(path_bytes(&source));
+        graph.action(
+            BuildAction::new(vec![
+                cc.clone(),
+                b"-c".to_vec(),
+                path_bytes(&source),
+                b"-o".to_vec(),
+                path_bytes(&object),
+            ])
+            .inherit_env()
+            .input(BuildArtifact::new(path_bytes(&source)))
+            .output(BuildArtifact::new(path_bytes(&object))),
+        );
+    }
+
+    let binary = out_dir.join("hello-demo");
+    let mut link_argv = vec![cc.clone(), b"-o".to_vec(), path_bytes(&binary)];
+    for object_name in ["main.o", "one.o", "two.o", "three.o", "four.o"] {
+        link_argv.push(path_bytes(out_dir.join(object_name)));
+    }
+    let mut link = BuildAction::new(link_argv)
+        .inherit_env()
+        .output(BuildArtifact::new(path_bytes(&binary)));
+    for object_name in ["main.o", "one.o", "two.o", "three.o", "four.o"] {
+        link = link.input(BuildArtifact::new(path_bytes(out_dir.join(object_name))));
+    }
+    let binary_handle = graph.action(link);
+    graph
+        .target("binary", binary_handle)
+        .map_err(|e| format!("target error: {e}"))?;
+
+    let term = graph
+        .to_expression()
+        .map_err(|e| format!("graph error: {e}"))?;
+
+    let cancellation = CancellationToken::new();
+    install_sigint_handler(cancellation.clone());
+    let mut host = Host::with_cancellation(cancellation.clone());
+    host.install_hermetic_process_spawn();
+
+    let traced = if memory_store {
+        let mut runtime = Runtime::new();
+        runtime
+            .run_with_trace_and_cancellation(term, &mut host, &cancellation)
+            .map_err(|error| format!("runtime error: {error}"))?
+    } else {
+        let store_path = store_path.unwrap_or_else(default_store_path);
+        let store = FileStore::open(&store_path)
+            .map_err(|error| format!("failed to open store {}: {error}", store_path.display()))?;
+        let mut runtime = Runtime::with_store(store);
+        runtime
+            .run_with_trace_and_cancellation(term, &mut host, &cancellation)
+            .map_err(|error| format!("runtime error: {error}"))?
+    };
+
+    print_traced_run(&traced, summary_requested);
+    Ok(())
 }
 
 fn run_store(args: impl Iterator<Item = String>) -> Result<(), String> {
@@ -104,53 +221,38 @@ fn parse_root(value: &str) -> Result<Ref, String> {
         .map_err(|error| format!("invalid root hash `{value}`: {error}"))
 }
 
-fn run_file(args: impl Iterator<Item = String>, force_trace: bool) -> Result<(), String> {
-    let parsed = parse_run_args(args, force_trace)?;
-    let source = fs::read_to_string(&parsed.path)
-        .map_err(|error| format!("failed to read {}: {error}", parsed.path))?;
-    let term = parse_program(&source)
-        .map_err(|error| format!("failed to parse {}: {error}", parsed.path))?;
-
-    if parsed.memory_store {
-        let mut runtime = Runtime::new();
-        run_term(term, &mut runtime, &parsed)
-    } else {
-        let store_path = parsed.store_path.clone().unwrap_or_else(default_store_path);
-        let store = FileStore::open(&store_path)
-            .map_err(|error| format!("failed to open store {}: {error}", store_path.display()))?;
-        let mut runtime = Runtime::with_store(store);
-        run_term(term, &mut runtime, &parsed)
-    }
+fn find_cc() -> Option<Vec<u8>> {
+    env::var_os("CC")
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+        .or_else(|| command_path("cc"))
+        .or_else(|| command_path("gcc"))
+        .map(path_bytes)
 }
 
-fn run_term<S: ObjectStore>(
-    term: r2::Term,
-    runtime: &mut Runtime<S>,
-    parsed: &ParsedRunArgs,
-) -> Result<(), String> {
-    let cancellation = CancellationToken::new();
-    install_sigint_handler(cancellation.clone());
-    let mut host = Host::with_cancellation(cancellation.clone());
-    host.install_fs_read();
-    host.install_fs_write();
-    host.install_clock();
-    host.install_math();
-    host.install_hermetic_process_spawn();
-    host.install_service_supervise();
-
-    if parsed.trace_requested {
-        let traced = runtime
-            .run_with_trace_and_cancellation(term, &mut host, &cancellation)
-            .map_err(|error| format!("runtime error: {error}"))?;
-        print_traced_run(&traced, parsed.summary_requested);
-    } else {
-        let value = runtime
-            .run_with_cancellation(term, &mut host, &cancellation)
-            .map_err(|error| format!("runtime error: {error}"))?;
-        println!("{}", format_runtime_value(&value));
+fn command_path(command: &str) -> Option<PathBuf> {
+    let output = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("command -v {command}"))
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
     }
+    let path = String::from_utf8(output.stdout).ok()?;
+    let path = path.trim();
+    (!path.is_empty()).then(|| PathBuf::from(path))
+}
 
-    Ok(())
+#[cfg(unix)]
+fn path_bytes(path: impl AsRef<std::path::Path>) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    path.as_ref().as_os_str().as_bytes().to_vec()
+}
+
+#[cfg(not(unix))]
+fn path_bytes(path: impl AsRef<std::path::Path>) -> Vec<u8> {
+    path.as_ref().to_string_lossy().as_bytes().to_vec()
 }
 
 fn install_sigint_handler(cancellation: CancellationToken) {
@@ -176,85 +278,6 @@ fn install_platform_sigint_handler() {
 
 #[cfg(not(unix))]
 fn install_platform_sigint_handler() {}
-
-struct ParsedRunArgs {
-    path: String,
-    trace_requested: bool,
-    summary_requested: bool,
-    store_path: Option<PathBuf>,
-    memory_store: bool,
-}
-
-fn parse_run_args(
-    args: impl Iterator<Item = String>,
-    force_trace: bool,
-) -> Result<ParsedRunArgs, String> {
-    let mut trace_requested = force_trace;
-    let mut summary_requested = false;
-    let mut store_path = None;
-    let mut memory_store = false;
-    let mut path = None;
-
-    let mut args = args.peekable();
-    while let Some(arg) = args.next() {
-        if !force_trace && arg == "--trace" {
-            trace_requested = true;
-            continue;
-        }
-
-        if arg == "--summary" {
-            summary_requested = true;
-            continue;
-        }
-
-        if arg == "--memory-store" {
-            memory_store = true;
-            continue;
-        }
-
-        if arg == "--store" {
-            let Some(value) = args.next() else {
-                return Err(format!("expected path after --store\n\n{}", usage()));
-            };
-            store_path = Some(PathBuf::from(value));
-            continue;
-        }
-
-        if let Some(value) = arg.strip_prefix("--store=") {
-            if value.is_empty() {
-                return Err(format!("expected path after --store=\n\n{}", usage()));
-            }
-            store_path = Some(PathBuf::from(value));
-            continue;
-        }
-
-        if arg.starts_with("--") {
-            return Err(format!("unknown flag `{arg}`\n\n{}", usage()));
-        }
-
-        if path.is_none() {
-            path = Some(arg);
-        } else {
-            return Err(format!("expected exactly one file path\n\n{}", usage()));
-        }
-    }
-
-    if memory_store && store_path.is_some() {
-        return Err(format!(
-            "--store and --memory-store cannot be used together\n\n{}",
-            usage()
-        ));
-    }
-
-    let path = path.ok_or_else(|| usage().to_string())?;
-    Ok(ParsedRunArgs {
-        path,
-        trace_requested,
-        summary_requested,
-        store_path,
-        memory_store,
-    })
-}
 
 fn default_store_path() -> PathBuf {
     default_store_base()

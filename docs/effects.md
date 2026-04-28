@@ -1,20 +1,21 @@
-# Effects and Policies
+# Effects
 
-Effects are the boundary between pure r2 evaluation and the outside world. A
-term performs an effect with `Term::Perform { op, args }`; the runtime yields
-that request to either a built-in handler or the host.
+Effects are the only way runtime work asks for outside-world authority.
 
-## Built-in vs Host Effects
+Policy glossary:
 
-Built-in effects are part of the runtime. Today the main built-ins are:
+- `volatile`: not cacheable; live world actions.
+- `stable`: cacheable without declared inputs; deterministic helpers.
+- `declared`: declared provenance, not cacheable.
+- `hermetic`: declared provenance and cacheable.
 
-- `thunk.force`, which implements lazy thunks and policy-aware caching.
-- `thunk.force_all`, an internal batch form used to force independent thunk
-  frontiers.
-- `record.get`, a stable record accessor used by surface `x.y` sugar. It keeps
-  field access out of the IR and does not grant authority.
+Built-ins:
 
-Host effects are registered on `Host`:
+- `thunk.force`: force delayed work and apply cache policy.
+- `thunk.force_all`: force an independent frontier.
+- `record.get`: runtime field access helper.
+
+Host effects:
 
 - `fs.read`
 - `fs.write`
@@ -24,73 +25,17 @@ Host effects are registered on `Host`:
 - `process.spawn`
 - `service.supervise`
 
-Each host handler receives evaluated runtime values, performs whatever outside
-work it owns, and resumes the captured continuation with a runtime value.
-Leaf host handlers live under `src/host/` when the split makes the capability
-easier to read. The process/cache/materialization path remains centralized in
-`host.rs` because those responsibilities share request parsing, provenance,
-output capture, and cache materialization helpers.
+Process glossary:
 
-## Policy Quadrants
+- `argv`: command vector.
+- `env_mode`: `clear` or `inherit`.
+- `env`: explicit environment overrides.
+- `cwd`: optional working directory.
+- `stdin`: input bytes.
+- `declared_inputs`: files hashed into provenance.
+- `declared_outputs`: files captured and rematerialized on cache hits.
 
-Every host effect has a `HostEffectPolicy`:
+Service glossary:
 
-- `volatile`: ambient and not cacheable. Use this for time, sleeps, filesystem writes, services, and other live-world actions.
-- `stable`: ambient but cacheable. Use this only for deterministic host helpers such as integer math.
-- `declared`: has declared provenance but is not cacheable. This is useful while an effect knows its inputs but is not trusted as reproducible.
-- `hermetic`: declared and cacheable. Use this when all relevant inputs are declared and included in the cache key.
-
-Policy controls thunk caching. If a thunk hits a non-cacheable effect, the
-runtime records a thunk-cache bypass and does not store the result.
-
-## Writing a New Effect
-
-1. Pick an op name, usually `module.verb`.
-2. Define a record-shaped request value. Prefer explicit fields over positional magic.
-3. Define a tagged result shape, usually `ok(record)` or a typed error tag.
-4. Register a host handler with the right policy.
-5. Add trace/acceptance tests that exercise the effect through the public runtime or CLI.
-
-Example shape:
-
-```rust
-host.register_stable("math.add", |args, continuation| {
-    // parse args, compute result
-    continuation.resume(RuntimeValue::Data(Value::Integer(5))).map_err(Into::into)
-});
-```
-
-## Process Effects
-
-`process.spawn` takes:
-
-- `argv`
-- `env_mode`
-- `env`
-- `cwd` optionally
-- `stdin`
-- `declared_inputs`
-- `declared_outputs`
-
-The hermetic process handler hashes declared input contents into its cache key,
-stores result values, and re-materializes declared outputs on cache hits.
-Before spawning, r2 creates parent directories for declared outputs, so a clean
-workspace does not need pre-created output directories.
-
-With the `sandbox` Cargo feature enabled, r2 also applies a conservative
-declared-path guard before spawning. Stronger OS-level isolation is still future
-work.
-
-## Service Effects
-
-`service.supervise` mirrors `process.spawn` and adds:
-
-```r2
-restart_policy: { mode: "on_failure", max_restarts: 3, delay_nanos: 0 }
-```
-
-It is volatile. It records generic host lifecycle trace events with
-`op = service.supervise` and phases `spawn`, `exit`, `restart`, and `stop`,
-then returns `ok({ final_status, restart_count })` when the policy stops.
-The handler is intentionally validation scaffolding over the process helpers,
-not a separate service subsystem.
+- `restart_policy`: mode, max restart count, and delay.
+- `service.supervise`: volatile process supervision with lifecycle trace events.

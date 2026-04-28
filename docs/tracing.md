@@ -1,80 +1,37 @@
 # Tracing
 
-Tracing is how r2 explains what happened at runtime. Use:
+Traces explain what the runtime did.
 
-```sh
-target/debug/r2 trace --summary --memory-store program.r2
-```
+Top-level output:
 
-The trace output has three parts:
-
-- `result`: the final runtime value.
-- `summary`: counters for evaluation, effects, caching, services, and store activity.
+- `result`: final runtime value.
+- `summary`: counters.
 - `trace`: ordered events.
 
-## Common Events
+Common events:
 
-- `eval start`: evaluation began for a term. Closed terms may include a digest.
-- `yield`: evaluation performed an effect.
-- `host handle`: the host handled an effect and shows its policy.
-- `host event`: a structured lifecycle event emitted by a host handler. The
-  event includes an op name, a phase, and fields.
-- `builtin handle`: the runtime handled a built-in effect.
-- `run complete`: a run finished with data, closure, continuation, or ref.
+- `eval start`: evaluation began.
+- `yield`: a term performed an effect.
+- `builtin handle`: runtime handled a built-in effect.
+- `host handle`: host handled an effect and records policy.
+- `host event`: structured lifecycle event from a host handler.
+- `run complete`: execution finished.
 
-## Cache Events
+Cache events:
 
-- `memo hit` / `memo store`: in-process memoization of closed pure terms.
-- `thunk force`: a thunk was forced.
-- `thunk force_all`: an internal batch of independent thunks was forced.
-- `task start` / `task end`: a `force_all` branch began or finished; the
-  event includes the task id and frontier id.
-- `thunk cache store`: a cacheable thunk result was stored.
-- `thunk cache hit`: a cached thunk result was reused.
-- `thunk cache invalidated`: a cached thunk result was rejected because its
-  declared inputs no longer match the cached provenance.
-- `thunk cache bypass`: a thunk touched a non-cacheable effect.
+- `memo hit`
+- `memo store`
+- `thunk force`
+- `thunk force_all`
+- `task start`
+- `task end`
+- `thunk cache hit`
+- `thunk cache store`
+- `thunk cache invalidated`
+- `thunk cache bypass`
 
-The policy shown on `host handle` explains most cache decisions. For example,
-`math.add [stable]` can participate in thunk caching, while `fs.write
-[volatile]` forces a bypass.
+Reading policy:
 
-## Host Lifecycle Events
-
-Service supervision emits generic host lifecycle events instead of dedicated
-runtime service variants. In textual traces they look like:
-
-- `host event: service.supervise spawn {...}`
-- `host event: service.supervise exit {...}`
-- `host event: service.supervise restart {...}`
-- `host event: service.supervise stop {...}`
-
-These make service behavior visible in the same trace stream as build-like
-cache behavior. That is the point of r2: builds and services are not separate
-worlds in the runtime. The summary still reports service spawn/exit/restart/stop
-counts as a convenience projection over those generic events.
-
-## Reading a Tiny Trace
-
-For:
-
-```r2
-let thunk = lazy { 2 + 3 };
-let _ = force thunk;
-force thunk
-```
-
-You should see one `math.add [stable]`, one `thunk cache store`, and one
-`thunk cache hit`. The first force computes and stores the result; the second
-force reuses it.
-
-For:
-
-```r2
-let thunk = lazy { perform fs.write("/tmp/r2-trace.txt", "hello") };
-let _ = force thunk;
-force thunk
-```
-
-You should see `fs.write [volatile]` and `thunk cache bypass`, because writes
-change the outside world and are not cacheable by default.
+- `stable` and `hermetic` effects may participate in thunk caching.
+- `volatile` effects force cache bypass.
+- invalidations mean declared provenance no longer matched.
