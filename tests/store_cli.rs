@@ -4,6 +4,7 @@ mod support;
 
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use support::{command_path, has_files_under, stderr, unique_temp_dir};
 
@@ -87,12 +88,19 @@ fn store_gc_command_deletes_unrooted_objects() {
     let _ = std::fs::remove_dir_all(store_path);
 }
 
-struct BuildDemoOutputsGuard;
+struct BuildDemoOutputsGuard {
+    _lock: MutexGuard<'static, ()>,
+}
 
 impl BuildDemoOutputsGuard {
     fn new() -> Self {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let lock = LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("build demo output lock should not be poisoned");
         clean_build_demo_outputs();
-        Self
+        Self { _lock: lock }
     }
 }
 

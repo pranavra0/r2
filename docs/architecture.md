@@ -16,6 +16,7 @@ Glossary:
 - `src/data.rs`: `Term`, `Value`, `Ref`, `Digest`, canonical encoding.
 - `src/eval.rs`: pure evaluator; no host IO.
 - `src/runtime.rs`: effect loop, built-ins, tracing, thunk cache, cancellation.
+- `src/runner.rs`: small setup layer for runtime, host, store, and cancellation.
 - `src/host.rs`: handler registry, policies, process cache/materialization.
 - `src/host/*`: leaf handlers for filesystem, clock, math, supervision.
 - `src/effects.rs`: typed request/result helpers.

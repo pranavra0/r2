@@ -3,6 +3,7 @@ pub mod data;
 pub mod effects;
 pub mod eval;
 pub mod host;
+pub mod runner;
 pub mod runtime;
 pub mod service;
 pub mod store;
@@ -24,6 +25,7 @@ pub use host::{
     Host, HostEffectCaching, HostEffectPolicy, HostEffectProvenance, HostError, HostHandler,
     HostTraceEvent,
 };
+pub use runner::RuntimeRunner;
 pub use runtime::{
     CancellationToken, Runtime, RuntimeError, RuntimeStoredKind, RuntimeTrace, RuntimeTraceEvent,
     RuntimeTraceSummary, RuntimeValueKind, TracedRun,

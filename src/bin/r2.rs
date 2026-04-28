@@ -5,8 +5,8 @@ use std::str::FromStr;
 use std::sync::OnceLock;
 
 use r2::{
-    BuildAction, BuildArtifact, BuildGraph, CancellationToken, Digest, FileStore, Host, Ref,
-    Reified, Runtime, RuntimeTrace, RuntimeTraceSummary, RuntimeValue, TracedRun, Value,
+    BuildAction, BuildArtifact, BuildGraph, CancellationToken, Digest, FileStore, Ref, Reified,
+    RuntimeRunner, RuntimeTrace, RuntimeTraceSummary, RuntimeValue, TracedRun, Value,
 };
 
 static CURRENT_CANCELLATION: OnceLock<CancellationToken> = OnceLock::new();
@@ -134,23 +134,20 @@ fn run_build_demo(args: impl Iterator<Item = String>) -> Result<(), String> {
         .to_expression()
         .map_err(|e| format!("graph error: {e}"))?;
 
-    let cancellation = CancellationToken::new();
-    install_sigint_handler(cancellation.clone());
-    let mut host = Host::with_cancellation(cancellation.clone());
-    host.install_hermetic_process_spawn();
-
     let traced = if memory_store {
-        let mut runtime = Runtime::new();
-        runtime
-            .run_with_trace_and_cancellation(term, &mut host, &cancellation)
+        let mut runner = RuntimeRunner::memory().process_build_host();
+        install_sigint_handler(runner.cancellation().clone());
+        runner
+            .run_traced(term)
             .map_err(|error| format!("runtime error: {error}"))?
     } else {
         let store_path = store_path.unwrap_or_else(default_store_path);
-        let store = FileStore::open(&store_path)
+        let mut runner = RuntimeRunner::file_store(&store_path)
             .map_err(|error| format!("failed to open store {}: {error}", store_path.display()))?;
-        let mut runtime = Runtime::with_store(store);
-        runtime
-            .run_with_trace_and_cancellation(term, &mut host, &cancellation)
+        runner = runner.process_build_host();
+        install_sigint_handler(runner.cancellation().clone());
+        runner
+            .run_traced(term)
             .map_err(|error| format!("runtime error: {error}"))?
     };
 
