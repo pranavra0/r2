@@ -1,6 +1,6 @@
 use crate::{
-    CapSet, Failure, FailureKind, ForceResult, GraphTrace, Hash, HostFn, Node, Outcome, Store,
-    Value,
+    CapSet, EffectKind, Failure, FailureKind, ForceResult, GraphTrace, Hash, HostFn, Node, Outcome,
+    Store, Value,
 };
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -46,12 +46,27 @@ impl Runtime {
         })
     }
 
+    pub fn host_call(
+        &self,
+        capability: impl Into<String>,
+        args: Vec<Hash>,
+        effect: EffectKind,
+    ) -> anyhow::Result<Hash> {
+        self.store.put_node(&Node::HostCall {
+            capability: capability.into(),
+            args,
+            effect,
+        })
+    }
+
     pub fn thunk(&self, target: Hash) -> anyhow::Result<Hash> {
         self.store.put_node(&Node::Thunk { target })
     }
 
     pub fn force(&self, node: Hash) -> anyhow::Result<ForceResult> {
-        if let Some(outcome) = self.store.get_outcome(&node)? {
+        if self.node_is_cacheable(&node, &mut BTreeSet::new())?
+            && let Some(outcome) = self.store.get_outcome(&node)?
+        {
             if let Some(failure) = self.validate_authority(&node)? {
                 return Ok(ForceResult {
                     outcome: Outcome::Failure(failure),
@@ -66,7 +81,7 @@ impl Runtime {
         }
 
         let outcome = self.eval(&node, &mut GraphTrace::default())?;
-        if outcome.is_cacheable() {
+        if self.should_cache(&node, &outcome)? {
             self.store.put_outcome(&node, &outcome)?;
         }
         Ok(ForceResult {
@@ -128,11 +143,13 @@ impl Runtime {
             }
             Node::Thunk { target } => self.force_dependency(&target, trace)?,
             Node::Apply { function, args } => {
-                self.eval_apply(node_hash, &function, &args, trace)?
+                self.eval_apply(node_hash, &function, &args, EffectKind::Pure, trace)?
             }
             Node::HostCall {
-                capability, args, ..
-            } => self.eval_apply(node_hash, &capability, &args, trace)?,
+                capability,
+                args,
+                effect,
+            } => self.eval_apply(node_hash, &capability, &args, effect, trace)?,
         };
 
         trace.pop();
@@ -144,6 +161,7 @@ impl Runtime {
         node_hash: &Hash,
         function: &str,
         args: &[Hash],
+        requested_effect: EffectKind,
         trace: &mut GraphTrace,
     ) -> anyhow::Result<Outcome> {
         let Some(cap) = self.caps.get(function) else {
@@ -153,6 +171,18 @@ impl Runtime {
                 trace.clone(),
             )));
         };
+
+        if cap.effect != requested_effect {
+            return Ok(Outcome::Failure(Failure::new(
+                node_hash.clone(),
+                FailureKind::EffectMismatch {
+                    capability: function.to_owned(),
+                    requested: requested_effect,
+                    actual: cap.effect.clone(),
+                },
+                trace.clone(),
+            )));
+        }
 
         let mut values = Vec::with_capacity(args.len());
         for arg in args {
@@ -185,7 +215,9 @@ impl Runtime {
     }
 
     fn force_dependency(&self, node: &Hash, trace: &mut GraphTrace) -> anyhow::Result<Outcome> {
-        if let Some(outcome) = self.store.get_outcome(node)? {
+        if self.node_is_cacheable(node, &mut BTreeSet::new())?
+            && let Some(outcome) = self.store.get_outcome(node)?
+        {
             if let Some(failure) = self.validate_authority_with_trace(node, trace.clone())? {
                 return Ok(Outcome::Failure(failure));
             }
@@ -193,7 +225,7 @@ impl Runtime {
         }
 
         let outcome = self.eval(node, trace)?;
-        if outcome.is_cacheable() {
+        if self.should_cache(node, &outcome)? {
             self.store.put_outcome(node, &outcome)?;
         }
         Ok(outcome)
@@ -250,27 +282,53 @@ impl Runtime {
             Node::Value(_) => None,
             Node::Thunk { target } => self.validate_authority_inner(&target, trace, visited)?,
             Node::Apply { function, args } => {
-                if self.caps.get(&function).is_none() {
+                if let Some(cap) = self.caps.get(&function) {
+                    if cap.effect != EffectKind::Pure {
+                        Some(Failure::new(
+                            node_hash.clone(),
+                            FailureKind::EffectMismatch {
+                                capability: function,
+                                requested: EffectKind::Pure,
+                                actual: cap.effect.clone(),
+                            },
+                            trace.clone(),
+                        ))
+                    } else {
+                        self.validate_args_authority(&args, trace, visited)?
+                    }
+                } else {
                     Some(Failure::new(
                         node_hash.clone(),
                         FailureKind::UnknownCapability(function),
                         trace.clone(),
                     ))
-                } else {
-                    self.validate_args_authority(&args, trace, visited)?
                 }
             }
             Node::HostCall {
-                capability, args, ..
+                capability,
+                args,
+                effect,
             } => {
-                if self.caps.get(&capability).is_none() {
+                if let Some(cap) = self.caps.get(&capability) {
+                    if cap.effect != effect {
+                        Some(Failure::new(
+                            node_hash.clone(),
+                            FailureKind::EffectMismatch {
+                                capability,
+                                requested: effect,
+                                actual: cap.effect.clone(),
+                            },
+                            trace.clone(),
+                        ))
+                    } else {
+                        self.validate_args_authority(&args, trace, visited)?
+                    }
+                } else {
                     Some(Failure::new(
                         node_hash.clone(),
                         FailureKind::UnknownCapability(capability),
                         trace.clone(),
                     ))
-                } else {
-                    self.validate_args_authority(&args, trace, visited)?
                 }
             }
         };
@@ -293,12 +351,59 @@ impl Runtime {
 
         Ok(None)
     }
+
+    fn should_cache(&self, node: &Hash, outcome: &Outcome) -> anyhow::Result<bool> {
+        Ok(outcome.is_cacheable() && self.node_is_cacheable(node, &mut BTreeSet::new())?)
+    }
+
+    fn node_is_cacheable(
+        &self,
+        node_hash: &Hash,
+        visited: &mut BTreeSet<Hash>,
+    ) -> anyhow::Result<bool> {
+        if !visited.insert(node_hash.clone()) {
+            return Ok(true);
+        }
+
+        let Some(node) = self.store.get_node(node_hash)? else {
+            return Ok(false);
+        };
+
+        match node {
+            Node::Value(_) => Ok(true),
+            Node::Thunk { target } => self.node_is_cacheable(&target, visited),
+            Node::Apply { args, .. } => self.args_are_cacheable(&args, visited),
+            Node::HostCall { effect, args, .. } => {
+                if effect == EffectKind::Live {
+                    Ok(false)
+                } else {
+                    self.args_are_cacheable(&args, visited)
+                }
+            }
+        }
+    }
+
+    fn args_are_cacheable(
+        &self,
+        args: &[Hash],
+        visited: &mut BTreeSet<Hash>,
+    ) -> anyhow::Result<bool> {
+        for arg in args {
+            if !self.node_is_cacheable(arg, visited)? {
+                return Ok(false);
+            }
+        }
+
+        Ok(true)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicI64, Ordering};
 
     fn add_ints(args: &[Value]) -> Result<Value, FailureKind> {
         match args {
@@ -468,6 +573,95 @@ mod tests {
             panic!("missing capability should block cached success");
         };
         assert_eq!(failure.kind, FailureKind::UnknownCapability("+".to_owned()));
+
+        std::fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn pure_apply_rejects_live_capability() -> anyhow::Result<()> {
+        let temp = temp_store()?;
+
+        let mut rt = Runtime::new(&temp)?;
+        rt.register("clock", HostFn::live(|_| Ok(Value::Int(1))));
+
+        let clock = rt.call("clock", vec![])?;
+        let forced = rt.force(clock)?;
+        let Outcome::Failure(failure) = forced.outcome else {
+            panic!("pure apply to live cap should fail");
+        };
+        assert_eq!(
+            failure.kind,
+            FailureKind::EffectMismatch {
+                capability: "clock".to_owned(),
+                requested: EffectKind::Pure,
+                actual: EffectKind::Live,
+            }
+        );
+        assert_eq!(rt.get_outcome(&failure.node)?, None);
+
+        std::fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn live_host_call_is_not_cached() -> anyhow::Result<()> {
+        let temp = temp_store()?;
+
+        let counter = Arc::new(AtomicI64::new(0));
+        let counter_for_cap = Arc::clone(&counter);
+        let mut rt = Runtime::new(&temp)?;
+        rt.register(
+            "next",
+            HostFn::live(move |_| {
+                let next = counter_for_cap.fetch_add(1, Ordering::SeqCst) + 1;
+                Ok(Value::Int(next))
+            }),
+        );
+
+        let next = rt.host_call("next", vec![], EffectKind::Live)?;
+        let first = rt.force(next.clone())?;
+        assert!(!first.cache_hit);
+        let Outcome::Success(first_hash) = first.outcome else {
+            panic!("live call should succeed");
+        };
+        assert_eq!(rt.get_value(&first_hash)?, Value::Int(1));
+        assert_eq!(rt.get_outcome(&next)?, None);
+
+        let second = rt.force(next)?;
+        assert!(!second.cache_hit);
+        let Outcome::Success(second_hash) = second.outcome else {
+            panic!("live call should succeed again");
+        };
+        assert_eq!(rt.get_value(&second_hash)?, Value::Int(2));
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
+
+        std::fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn host_call_rejects_wrong_declared_effect() -> anyhow::Result<()> {
+        let temp = temp_store()?;
+
+        let mut rt = Runtime::new(&temp)?;
+        rt.register("+", HostFn::pure(add_ints));
+
+        let a = rt.int(1)?;
+        let b = rt.int(2)?;
+        let sum = rt.host_call("+", vec![a, b], EffectKind::Live)?;
+        let forced = rt.force(sum)?;
+        let Outcome::Failure(failure) = forced.outcome else {
+            panic!("wrong host call effect should fail");
+        };
+        assert_eq!(
+            failure.kind,
+            FailureKind::EffectMismatch {
+                capability: "+".to_owned(),
+                requested: EffectKind::Live,
+                actual: EffectKind::Pure,
+            }
+        );
 
         std::fs::remove_dir_all(temp)?;
         Ok(())

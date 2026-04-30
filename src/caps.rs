@@ -19,6 +19,20 @@ impl HostFn {
         }
     }
 
+    pub fn hermetic(func: impl Fn(&[Value]) -> HostResult + Send + Sync + 'static) -> Self {
+        Self {
+            effect: EffectKind::Hermetic,
+            func: Arc::new(func),
+        }
+    }
+
+    pub fn live(func: impl Fn(&[Value]) -> HostResult + Send + Sync + 'static) -> Self {
+        Self {
+            effect: EffectKind::Live,
+            func: Arc::new(func),
+        }
+    }
+
     pub fn call(&self, args: &[Value]) -> HostResult {
         (self.func)(args)
     }

@@ -1,4 +1,4 @@
-use crate::{GraphTrace, Hash};
+use crate::{EffectKind, GraphTrace, Hash};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
@@ -7,6 +7,12 @@ pub enum FailureKind {
     UnknownCapability(String),
     #[error("permission denied: {0}")]
     PermissionDenied(String),
+    #[error("effect mismatch for {capability}: requested {requested:?}, capability is {actual:?}")]
+    EffectMismatch {
+        capability: String,
+        requested: EffectKind,
+        actual: EffectKind,
+    },
     #[error("type error: {0}")]
     TypeError(String),
     #[error("missing object: {0}")]
@@ -19,7 +25,10 @@ pub enum FailureKind {
 
 impl FailureKind {
     pub fn is_cacheable(&self) -> bool {
-        !matches!(self, Self::UnknownCapability(_) | Self::PermissionDenied(_))
+        !matches!(
+            self,
+            Self::UnknownCapability(_) | Self::PermissionDenied(_) | Self::EffectMismatch { .. }
+        )
     }
 }
 
