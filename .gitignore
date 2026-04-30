@@ -1,6 +1,9 @@
 /target
 /design
 /.r2
+/examples/demo-src
+/examples/hello-c
+/examples/out
 
 
 # Added by cargo

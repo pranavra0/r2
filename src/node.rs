@@ -1,4 +1,4 @@
-use crate::{Hash, Value};
+use crate::{ActionSpec, Hash, Value};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -23,4 +23,5 @@ pub enum Node {
         args: Vec<Hash>,
         effect: EffectKind,
     },
+    Action(ActionSpec),
 }

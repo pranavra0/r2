@@ -21,6 +21,15 @@ pub enum FailureKind {
     Cycle(Hash),
     #[error("host function failed: {0}")]
     Host(String),
+    #[error("action failed: {program} exited with {status}")]
+    ActionFailed {
+        program: String,
+        status: String,
+        stdout: String,
+        stderr: String,
+    },
+    #[error("action output missing: {0}")]
+    MissingActionOutput(String),
 }
 
 impl FailureKind {

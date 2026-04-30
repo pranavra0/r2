@@ -1,5 +1,5 @@
 use crate::encode;
-use crate::{Hash, Node, Outcome, Value};
+use crate::{ActionInput, Hash, Node, Outcome, TreeEntry, Value};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -28,6 +28,14 @@ pub struct GcPlan {
     pub reachable_outcomes: BTreeSet<Hash>,
     pub unreachable_objects: BTreeSet<Hash>,
     pub unreachable_outcomes: BTreeSet<Hash>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GcReport {
+    pub plan: GcPlan,
+    pub deleted_objects: u64,
+    pub deleted_outcomes: u64,
+    pub deleted_bytes: u64,
 }
 
 impl Store {
@@ -150,6 +158,38 @@ impl Store {
         })
     }
 
+    pub fn gc(&self) -> anyhow::Result<GcReport> {
+        let plan = self.gc_plan()?;
+        let mut deleted_objects = 0;
+        let mut deleted_outcomes = 0;
+        let mut deleted_bytes = 0;
+
+        for hash in &plan.unreachable_outcomes {
+            let path = self.outcome_path(hash);
+            if path.exists() {
+                deleted_bytes += fs::metadata(&path)?.len();
+                fs::remove_file(path)?;
+                deleted_outcomes += 1;
+            }
+        }
+
+        for hash in &plan.unreachable_objects {
+            let path = self.object_path(hash);
+            if path.exists() {
+                deleted_bytes += fs::metadata(&path)?.len();
+                fs::remove_file(path)?;
+                deleted_objects += 1;
+            }
+        }
+
+        Ok(GcReport {
+            plan,
+            deleted_objects,
+            deleted_outcomes,
+            deleted_bytes,
+        })
+    }
+
     fn put_object<T: Serialize>(&self, kind: ObjectKind, object: &T) -> anyhow::Result<Hash> {
         let payload = encode(object)?;
         let hash = Hash::new(kind.domain(), &payload);
@@ -244,6 +284,12 @@ impl Store {
                     self.mark_reachable_object(arg, reachable_objects, reachable_outcomes)?;
                 }
             }
+            Node::Action(spec) => {
+                self.mark_reachable_object(&spec.tool, reachable_objects, reachable_outcomes)?;
+                for ActionInput { hash, .. } in &spec.inputs {
+                    self.mark_reachable_object(hash, reachable_objects, reachable_outcomes)?;
+                }
+            }
         }
 
         Ok(())
@@ -256,7 +302,20 @@ impl Store {
         reachable_outcomes: &mut BTreeSet<Hash>,
     ) -> anyhow::Result<()> {
         match value {
-            Value::Int(_) | Value::Text(_) | Value::Bytes(_) => {}
+            Value::Int(_) | Value::Text(_) | Value::Bytes(_) | Value::Blob(_) => {}
+            Value::Tree(tree) => {
+                for entry in tree.entries.values() {
+                    match entry {
+                        TreeEntry::Blob(hash) | TreeEntry::Tree(hash) => {
+                            self.mark_reachable_object(
+                                hash,
+                                reachable_objects,
+                                reachable_outcomes,
+                            )?;
+                        }
+                    }
+                }
+            }
             Value::Tuple(items) => {
                 for item in items {
                     self.mark_reachable_object(item, reachable_objects, reachable_outcomes)?;
@@ -264,6 +323,15 @@ impl Store {
             }
             Value::Artifact(hash) => {
                 self.mark_reachable_object(hash, reachable_objects, reachable_outcomes)?;
+            }
+            Value::ActionResult {
+                outputs,
+                stdout,
+                stderr,
+            } => {
+                self.mark_reachable_object(outputs, reachable_objects, reachable_outcomes)?;
+                self.mark_reachable_object(stdout, reachable_objects, reachable_outcomes)?;
+                self.mark_reachable_object(stderr, reachable_objects, reachable_outcomes)?;
             }
         }
 

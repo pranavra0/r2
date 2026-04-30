@@ -1,9 +1,11 @@
 use crate::{
-    CapSet, EffectKind, Failure, FailureKind, ForceResult, GcPlan, GraphTrace, Hash, HostFn, Node,
-    Outcome, Store, StoreStats, Value,
+    ActionSpec, CapSet, EffectKind, Failure, FailureKind, ForceResult, GcPlan, GcReport,
+    GraphTrace, Hash, HostFn, Node, Outcome, Store, StoreStats, Tree, TreeEntry, Value,
 };
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::path::Path;
+use std::process::Command;
 
 pub struct Runtime {
     store: Store,
@@ -50,6 +52,86 @@ impl Runtime {
         self.value(Value::Text(value.into()))
     }
 
+    pub fn blob(&self, bytes: Vec<u8>) -> anyhow::Result<Hash> {
+        self.value(Value::Blob(bytes))
+    }
+
+    pub fn tree(&self, entries: BTreeMap<String, TreeEntry>) -> anyhow::Result<Hash> {
+        self.value(Value::Tree(Tree { entries }))
+    }
+
+    pub fn import_file(&self, path: impl AsRef<Path>) -> anyhow::Result<Hash> {
+        let bytes = std::fs::read(path)?;
+        self.blob(bytes)
+    }
+
+    pub fn import_tool(&self, path: impl AsRef<Path>) -> anyhow::Result<Hash> {
+        self.import_file(path)
+    }
+
+    pub fn import_tree(&self, path: impl AsRef<Path>) -> anyhow::Result<Hash> {
+        self.import_tree_inner(path.as_ref())
+    }
+
+    pub fn export(&self, hash: Hash, destination: impl AsRef<Path>) -> anyhow::Result<()> {
+        let (value, _) = self.force_value(hash)?;
+        self.materialize_value(&value, destination.as_ref())
+    }
+
+    pub fn tree_get(&self, tree: Hash, path: &str) -> anyhow::Result<Option<Hash>> {
+        let (value, _) = self.force_value(tree)?;
+        let Value::Tree(tree) = value else {
+            anyhow::bail!("tree_get expected a tree");
+        };
+
+        let mut current = tree;
+        let mut parts = path.split('/').filter(|part| !part.is_empty()).peekable();
+        while let Some(part) = parts.next() {
+            let Some(entry) = current.entries.get(part) else {
+                return Ok(None);
+            };
+
+            match entry {
+                TreeEntry::Blob(hash) => {
+                    if parts.peek().is_some() {
+                        return Ok(None);
+                    }
+                    return Ok(Some(hash.clone()));
+                }
+                TreeEntry::Tree(hash) => {
+                    if parts.peek().is_none() {
+                        return Ok(Some(hash.clone()));
+                    }
+                    let (value, _) = self.force_value(hash.clone())?;
+                    let Value::Tree(next) = value else {
+                        anyhow::bail!("tree entry {part} points to non-tree value");
+                    };
+                    current = next;
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
+    pub fn tree_put(&self, tree: Hash, path: &str, entry: TreeEntry) -> anyhow::Result<Hash> {
+        let parts = path
+            .split('/')
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>();
+        if parts.is_empty() {
+            anyhow::bail!("tree_put requires a non-empty path");
+        }
+
+        let (value, _) = self.force_value(tree)?;
+        let Value::Tree(mut root) = value else {
+            anyhow::bail!("tree_put expected a tree");
+        };
+
+        self.tree_put_parts(&mut root, &parts, entry)?;
+        self.tree(root.entries)
+    }
+
     pub fn value(&self, value: Value) -> anyhow::Result<Hash> {
         self.store.put_value(&value)?;
         self.store.put_node(&Node::Value(value))
@@ -73,6 +155,10 @@ impl Runtime {
             args,
             effect,
         })
+    }
+
+    pub fn action(&self, spec: ActionSpec) -> anyhow::Result<Hash> {
+        self.store.put_node(&Node::Action(spec))
     }
 
     pub fn thunk(&self, target: Hash) -> anyhow::Result<Hash> {
@@ -171,6 +257,69 @@ impl Runtime {
         self.store.gc_plan()
     }
 
+    pub fn gc(&self) -> anyhow::Result<GcReport> {
+        self.store.gc()
+    }
+
+    fn import_tree_inner(&self, path: &Path) -> anyhow::Result<Hash> {
+        let mut entries = BTreeMap::new();
+        for entry in std::fs::read_dir(path)? {
+            let entry = entry?;
+            let file_name = entry.file_name();
+            let name = file_name
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("path contains non-utf8 entry: {:?}", file_name))?;
+
+            let file_type = entry.file_type()?;
+            let entry_path = entry.path();
+            if file_type.is_dir() {
+                let tree = self.import_tree_inner(&entry_path)?;
+                entries.insert(name.to_owned(), TreeEntry::Tree(tree));
+            } else if file_type.is_file() {
+                let blob = self.import_file(&entry_path)?;
+                entries.insert(name.to_owned(), TreeEntry::Blob(blob));
+            }
+        }
+
+        self.tree(entries)
+    }
+
+    fn tree_put_parts(
+        &self,
+        tree: &mut Tree,
+        parts: &[&str],
+        entry: TreeEntry,
+    ) -> anyhow::Result<()> {
+        if parts.len() == 1 {
+            tree.entries.insert(parts[0].to_owned(), entry);
+            return Ok(());
+        }
+
+        let head = parts[0];
+        let child = match tree.entries.get(head) {
+            Some(TreeEntry::Tree(hash)) => {
+                let (value, _) = self.force_value(hash.clone())?;
+                let Value::Tree(tree) = value else {
+                    anyhow::bail!("tree entry {head} points to non-tree value");
+                };
+                tree
+            }
+            Some(TreeEntry::Blob(_)) => {
+                anyhow::bail!("cannot put below blob at {head}");
+            }
+            None => Tree {
+                entries: BTreeMap::new(),
+            },
+        };
+
+        let mut child = child;
+        self.tree_put_parts(&mut child, &parts[1..], entry)?;
+        let child_hash = self.tree(child.entries)?;
+        tree.entries
+            .insert(head.to_owned(), TreeEntry::Tree(child_hash));
+        Ok(())
+    }
+
     fn eval(&self, node_hash: &Hash, trace: &mut GraphTrace) -> anyhow::Result<Outcome> {
         if trace.contains(node_hash) {
             return Ok(Outcome::Failure(Failure::new(
@@ -206,6 +355,7 @@ impl Runtime {
                 args,
                 effect,
             } => self.eval_apply(node_hash, &capability, &args, effect, trace)?,
+            Node::Action(spec) => self.eval_action(node_hash, &spec, trace)?,
         };
 
         trace.pop();
@@ -269,6 +419,138 @@ impl Runtime {
                 trace.clone(),
             ))),
         }
+    }
+
+    fn eval_action(
+        &self,
+        node_hash: &Hash,
+        spec: &ActionSpec,
+        trace: &mut GraphTrace,
+    ) -> anyhow::Result<Outcome> {
+        let workspace = self.new_workspace()?;
+        for input in &spec.inputs {
+            let destination = workspace.join(&input.path);
+            self.materialize_hash(&input.hash, &destination, trace)?;
+        }
+
+        let output = Command::new(&spec.program)
+            .args(&spec.args)
+            .env_clear()
+            .envs(&spec.env)
+            .current_dir(&workspace)
+            .output();
+
+        let output = match output {
+            Ok(output) => output,
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(&workspace);
+                return Ok(Outcome::Failure(Failure::new(
+                    node_hash.clone(),
+                    FailureKind::Host(format!("failed to run action {}: {error}", spec.program)),
+                    trace.clone(),
+                )));
+            }
+        };
+
+        if !output.status.success() {
+            let _ = std::fs::remove_dir_all(&workspace);
+            return Ok(Outcome::Failure(Failure::new(
+                node_hash.clone(),
+                FailureKind::ActionFailed {
+                    program: spec.program.clone(),
+                    status: output
+                        .status
+                        .code()
+                        .map(|code| code.to_string())
+                        .unwrap_or_else(|| "signal".to_owned()),
+                    stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                    stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+                },
+                trace.clone(),
+            )));
+        }
+
+        let mut entries = BTreeMap::new();
+        for output_path in &spec.outputs {
+            let path = workspace.join(output_path);
+            if path.is_file() {
+                let hash = self.import_file(&path)?;
+                entries.insert(output_path.clone(), TreeEntry::Blob(hash));
+            } else if path.is_dir() {
+                let hash = self.import_tree(&path)?;
+                entries.insert(output_path.clone(), TreeEntry::Tree(hash));
+            } else {
+                let _ = std::fs::remove_dir_all(&workspace);
+                return Ok(Outcome::Failure(Failure::new(
+                    node_hash.clone(),
+                    FailureKind::MissingActionOutput(output_path.clone()),
+                    trace.clone(),
+                )));
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&workspace);
+        let output_tree = self.tree(entries)?;
+        let stdout = self.blob(output.stdout)?;
+        let stderr = self.blob(output.stderr)?;
+        let value_hash = self.store.put_value(&Value::ActionResult {
+            outputs: output_tree,
+            stdout,
+            stderr,
+        })?;
+        Ok(Outcome::Success(value_hash))
+    }
+
+    fn materialize_hash(
+        &self,
+        hash: &Hash,
+        destination: &Path,
+        trace: &mut GraphTrace,
+    ) -> anyhow::Result<()> {
+        let outcome = self.force_dependency(hash, trace)?;
+        let Outcome::Success(value_hash) = outcome else {
+            anyhow::bail!("cannot materialize failed input {hash}");
+        };
+        let Some(value) = self.store.get_value(&value_hash)? else {
+            anyhow::bail!("input {hash} resolved to missing value {value_hash}");
+        };
+        self.materialize_value(&value, destination)
+    }
+
+    fn materialize_value(&self, value: &Value, destination: &Path) -> anyhow::Result<()> {
+        match value {
+            Value::Blob(bytes) | Value::Bytes(bytes) => {
+                if let Some(parent) = destination.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(destination, bytes)?;
+            }
+            Value::Tree(tree) => {
+                std::fs::create_dir_all(destination)?;
+                for (name, entry) in &tree.entries {
+                    let child = destination.join(name);
+                    match entry {
+                        TreeEntry::Blob(hash) | TreeEntry::Tree(hash) => {
+                            let (value, _) = self.force_value(hash.clone())?;
+                            self.materialize_value(&value, &child)?;
+                        }
+                    }
+                }
+            }
+            other => anyhow::bail!("cannot materialize value as file/tree: {other:?}"),
+        }
+        Ok(())
+    }
+
+    fn new_workspace(&self) -> anyhow::Result<std::path::PathBuf> {
+        let path = std::env::temp_dir().join(format!(
+            "r2-action-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&path)?;
+        Ok(path)
     }
 
     fn force_dependency(&self, node: &Hash, trace: &mut GraphTrace) -> anyhow::Result<Outcome> {
@@ -390,6 +672,7 @@ impl Runtime {
                     ))
                 }
             }
+            Node::Action(spec) => self.validate_action_authority(&spec, trace, visited)?,
         };
 
         trace.pop();
@@ -408,6 +691,23 @@ impl Runtime {
             }
         }
 
+        Ok(None)
+    }
+
+    fn validate_action_authority(
+        &self,
+        spec: &ActionSpec,
+        trace: &mut GraphTrace,
+        visited: &mut BTreeSet<Hash>,
+    ) -> anyhow::Result<Option<Failure>> {
+        if let Some(failure) = self.validate_authority_inner(&spec.tool, trace, visited)? {
+            return Ok(Some(failure));
+        }
+        for input in &spec.inputs {
+            if let Some(failure) = self.validate_authority_inner(&input.hash, trace, visited)? {
+                return Ok(Some(failure));
+            }
+        }
         Ok(None)
     }
 
@@ -438,6 +738,17 @@ impl Runtime {
                 } else {
                     self.args_are_cacheable(&args, visited)
                 }
+            }
+            Node::Action(spec) => {
+                if !self.node_is_cacheable(&spec.tool, visited)? {
+                    return Ok(false);
+                }
+                for input in &spec.inputs {
+                    if !self.node_is_cacheable(&input.hash, visited)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
             }
         }
     }
@@ -896,6 +1207,251 @@ mod tests {
         assert_eq!(plan.roots.get("demo.seven"), None);
         assert!(!plan.reachable_objects.contains(&value));
         assert!(plan.unreachable_objects.contains(&value));
+
+        std::fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn gc_deletes_unreachable_objects_and_preserves_pins_and_aliases() -> anyhow::Result<()> {
+        let temp = temp_store()?;
+
+        let mut rt = Runtime::new(&temp)?;
+        rt.register("+", HostFn::pure(add_ints));
+
+        let a = rt.int(20)?;
+        let b = rt.int(22)?;
+        let sum_expr = rt.call("+", vec![a, b])?;
+        let sum = rt.thunk(sum_expr)?;
+        rt.force(sum.clone())?;
+        rt.pin("demo.sum", sum.clone())?;
+
+        let alias_only = rt.int(7)?;
+        rt.alias("demo.seven", alias_only.clone())?;
+        assert!(rt.get_node(&alias_only)?.is_some());
+
+        let report = rt.gc()?;
+        assert!(report.deleted_objects > 0);
+        assert!(report.deleted_bytes > 0);
+        assert!(report.plan.unreachable_objects.contains(&alias_only));
+
+        assert!(rt.get_node(&sum)?.is_some());
+        assert_eq!(rt.resolve_pin("demo.sum")?, Some(sum));
+        assert_eq!(rt.resolve_alias("demo.seven")?, Some(alias_only.clone()));
+        assert_eq!(rt.get_node(&alias_only)?, None);
+
+        let second = rt.gc()?;
+        assert_eq!(second.deleted_objects, 0);
+        assert_eq!(second.deleted_outcomes, 0);
+
+        std::fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn imports_files_and_trees_as_content_values() -> anyhow::Result<()> {
+        let temp = temp_store()?;
+        let source_dir = temp.join("src");
+        let nested_dir = source_dir.join("nested");
+        std::fs::create_dir_all(&nested_dir)?;
+        std::fs::write(source_dir.join("main.txt"), b"hello")?;
+        std::fs::write(nested_dir.join("lib.txt"), b"world")?;
+
+        let rt = Runtime::new(temp.join("store"))?;
+        let file = rt.import_file(source_dir.join("main.txt"))?;
+        assert_eq!(rt.force_value(file)?.0, Value::Blob(b"hello".to_vec()));
+
+        let tree = rt.import_tree(&source_dir)?;
+        let Value::Tree(tree_value) = rt.force_value(tree)?.0 else {
+            panic!("import_tree should return a tree value");
+        };
+        assert!(matches!(
+            tree_value.entries.get("main.txt"),
+            Some(TreeEntry::Blob(_))
+        ));
+        assert!(matches!(
+            tree_value.entries.get("nested"),
+            Some(TreeEntry::Tree(_))
+        ));
+
+        std::fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn gc_traces_tree_entries() -> anyhow::Result<()> {
+        let temp = temp_store()?;
+        let source_dir = temp.join("src");
+        std::fs::create_dir_all(&source_dir)?;
+        std::fs::write(source_dir.join("main.txt"), b"hello")?;
+
+        let rt = Runtime::new(temp.join("store"))?;
+        let tree = rt.import_tree(&source_dir)?;
+        let Value::Tree(tree_value) = rt.force_value(tree.clone())?.0 else {
+            panic!("import_tree should return a tree value");
+        };
+        let Some(TreeEntry::Blob(blob)) = tree_value.entries.get("main.txt") else {
+            panic!("tree should contain imported blob");
+        };
+        let blob = blob.clone();
+
+        rt.pin("demo.src", tree.clone())?;
+        let plan = rt.gc_plan()?;
+        assert!(plan.reachable_objects.contains(&tree));
+        assert!(plan.reachable_objects.contains(&blob));
+
+        std::fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn tree_get_and_put_create_new_immutable_trees() -> anyhow::Result<()> {
+        let temp = temp_store()?;
+        let source_dir = temp.join("src");
+        std::fs::create_dir_all(&source_dir)?;
+        std::fs::write(source_dir.join("main.txt"), b"hello")?;
+
+        let rt = Runtime::new(temp.join("store"))?;
+        let tree = rt.import_tree(&source_dir)?;
+        let main = rt
+            .tree_get(tree.clone(), "main.txt")?
+            .expect("main.txt should exist");
+        assert_eq!(rt.force_value(main)?.0, Value::Blob(b"hello".to_vec()));
+
+        let generated = rt.blob(b"generated".to_vec())?;
+        let updated = rt.tree_put(
+            tree.clone(),
+            "nested/generated.txt",
+            TreeEntry::Blob(generated.clone()),
+        )?;
+
+        assert_eq!(rt.tree_get(tree, "nested/generated.txt")?, None);
+        assert_eq!(
+            rt.tree_get(updated, "nested/generated.txt")?,
+            Some(generated.clone())
+        );
+        assert_eq!(
+            rt.force_value(generated)?.0,
+            Value::Blob(b"generated".to_vec())
+        );
+
+        std::fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn exports_blobs_and_trees_to_host_paths() -> anyhow::Result<()> {
+        let temp = temp_store()?;
+        let rt = Runtime::new(temp.join("store"))?;
+
+        let blob = rt.blob(b"hello export".to_vec())?;
+        let blob_dest = temp.join("out.txt");
+        rt.export(blob, &blob_dest)?;
+        assert_eq!(std::fs::read(&blob_dest)?, b"hello export");
+
+        let inner = rt.blob(b"nested".to_vec())?;
+        let tree = rt.tree(BTreeMap::from([(
+            "nested.txt".to_owned(),
+            TreeEntry::Blob(inner),
+        )]))?;
+        let tree_dest = temp.join("tree-out");
+        rt.export(tree, &tree_dest)?;
+        assert_eq!(std::fs::read(tree_dest.join("nested.txt"))?, b"nested");
+
+        std::fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn hermetic_action_runs_with_declared_inputs_and_caches_output_tree() -> anyhow::Result<()> {
+        let temp = temp_store()?;
+        let source_dir = temp.join("src");
+        std::fs::create_dir_all(&source_dir)?;
+        std::fs::write(source_dir.join("main.txt"), b"hello action")?;
+
+        let rt = Runtime::new(temp.join("store"))?;
+        let src = rt.import_tree(&source_dir)?;
+        let cp = rt.import_tool("/bin/cp")?;
+        let action = rt.action(ActionSpec {
+            program: "/bin/cp".to_owned(),
+            tool: cp,
+            args: vec!["src/main.txt".to_owned(), "out.txt".to_owned()],
+            env: BTreeMap::new(),
+            platform: std::env::consts::OS.to_owned(),
+            inputs: vec![crate::ActionInput {
+                path: "src".to_owned(),
+                hash: src,
+            }],
+            outputs: vec!["out.txt".to_owned()],
+        })?;
+
+        let first = rt.force(action.clone())?;
+        assert!(!first.cache_hit);
+        let Outcome::Success(output_tree_hash) = first.outcome else {
+            panic!("action should succeed");
+        };
+        let Value::ActionResult {
+            outputs,
+            stdout,
+            stderr,
+        } = rt.get_value(&output_tree_hash)?
+        else {
+            panic!("action should produce an action result");
+        };
+        assert_eq!(rt.force_value(stdout)?.0, Value::Blob(Vec::new()));
+        assert_eq!(rt.force_value(stderr)?.0, Value::Blob(Vec::new()));
+
+        let Value::Tree(output_tree) = rt.force_value(outputs)?.0 else {
+            panic!("action result should reference an output tree");
+        };
+        let Some(TreeEntry::Blob(out_blob)) = output_tree.entries.get("out.txt") else {
+            panic!("output tree should contain out.txt");
+        };
+        assert_eq!(
+            rt.force_value(out_blob.clone())?.0,
+            Value::Blob(b"hello action".to_vec())
+        );
+
+        let second = rt.force(action)?;
+        assert!(second.cache_hit);
+
+        std::fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn hermetic_action_failure_has_trace_and_logs() -> anyhow::Result<()> {
+        let temp = temp_store()?;
+        let rt = Runtime::new(temp.join("store"))?;
+        let cp = rt.import_tool("/bin/cp")?;
+        let action_expr = rt.action(ActionSpec {
+            program: "/bin/cp".to_owned(),
+            tool: cp,
+            args: vec!["missing.txt".to_owned(), "out.txt".to_owned()],
+            env: BTreeMap::new(),
+            platform: std::env::consts::OS.to_owned(),
+            inputs: vec![],
+            outputs: vec!["out.txt".to_owned()],
+        })?;
+        let action = rt.thunk(action_expr.clone())?;
+
+        let forced = rt.force(action.clone())?;
+        let Outcome::Failure(failure) = forced.outcome else {
+            panic!("action should fail");
+        };
+        assert_eq!(failure.trace.hashes(), &[action, action_expr]);
+        let FailureKind::ActionFailed {
+            program,
+            status,
+            stderr,
+            ..
+        } = failure.kind
+        else {
+            panic!("expected action failure");
+        };
+        assert_eq!(program, "/bin/cp");
+        assert_ne!(status, "0");
+        assert!(stderr.contains("missing.txt"));
 
         std::fs::remove_dir_all(temp)?;
         Ok(())

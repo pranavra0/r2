@@ -1,3 +1,4 @@
+pub mod action;
 pub mod caps;
 pub mod encode;
 pub mod failure;
@@ -9,12 +10,13 @@ pub mod store;
 pub mod trace;
 pub mod value;
 
+pub use action::{ActionInput, ActionSpec};
 pub use caps::{CapSet, Capability, HostFn};
 pub use failure::{Failure, FailureKind};
 pub use hash::Hash;
 pub use node::{EffectKind, Node};
 pub use outcome::{ForceResult, Outcome};
 pub use runtime::Runtime;
-pub use store::{GcPlan, Store, StoreStats};
+pub use store::{GcPlan, GcReport, Store, StoreStats};
 pub use trace::GraphTrace;
-pub use value::Value;
+pub use value::{Tree, TreeEntry, Value};
