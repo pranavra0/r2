@@ -26,6 +26,22 @@ impl Runtime {
         self.caps.insert(name, func);
     }
 
+    pub fn has_capability(&self, name: &str) -> bool {
+        self.caps.contains(name)
+    }
+
+    pub fn capability_effect(&self, name: &str) -> Option<EffectKind> {
+        self.caps.effect(name)
+    }
+
+    pub fn capability(&self, name: &str) -> Option<crate::Capability> {
+        self.caps.capability(name)
+    }
+
+    pub fn capabilities(&self) -> Vec<crate::Capability> {
+        self.caps.capabilities()
+    }
+
     pub fn int(&self, value: i64) -> anyhow::Result<Hash> {
         self.value(Value::Int(value))
     }
@@ -172,13 +188,14 @@ impl Runtime {
             )));
         };
 
-        if cap.effect != requested_effect {
+        let actual_effect = cap.effect();
+        if actual_effect != requested_effect {
             return Ok(Outcome::Failure(Failure::new(
                 node_hash.clone(),
                 FailureKind::EffectMismatch {
                     capability: function.to_owned(),
                     requested: requested_effect,
-                    actual: cap.effect.clone(),
+                    actual: actual_effect,
                 },
                 trace.clone(),
             )));
@@ -283,13 +300,14 @@ impl Runtime {
             Node::Thunk { target } => self.validate_authority_inner(&target, trace, visited)?,
             Node::Apply { function, args } => {
                 if let Some(cap) = self.caps.get(&function) {
-                    if cap.effect != EffectKind::Pure {
+                    let actual_effect = cap.effect();
+                    if actual_effect != EffectKind::Pure {
                         Some(Failure::new(
                             node_hash.clone(),
                             FailureKind::EffectMismatch {
                                 capability: function,
                                 requested: EffectKind::Pure,
-                                actual: cap.effect.clone(),
+                                actual: actual_effect,
                             },
                             trace.clone(),
                         ))
@@ -310,13 +328,14 @@ impl Runtime {
                 effect,
             } => {
                 if let Some(cap) = self.caps.get(&capability) {
-                    if cap.effect != effect {
+                    let actual_effect = cap.effect();
+                    if actual_effect != effect {
                         Some(Failure::new(
                             node_hash.clone(),
                             FailureKind::EffectMismatch {
                                 capability,
                                 requested: effect,
-                                actual: cap.effect.clone(),
+                                actual: actual_effect,
                             },
                             trace.clone(),
                         ))
@@ -442,6 +461,36 @@ mod tests {
 
         let second = rt.force(sum)?;
         assert!(second.cache_hit);
+
+        std::fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn exposes_capability_metadata() -> anyhow::Result<()> {
+        let temp = temp_store()?;
+
+        let mut rt = Runtime::new(&temp)?;
+        rt.register("+", HostFn::pure(add_ints));
+        rt.register("clock", HostFn::live(|_| Ok(Value::Int(1))));
+
+        assert!(rt.has_capability("+"));
+        assert!(!rt.has_capability("network"));
+        assert_eq!(rt.capability_effect("+"), Some(EffectKind::Pure));
+        assert_eq!(rt.capability_effect("clock"), Some(EffectKind::Live));
+        assert_eq!(rt.capability_effect("network"), None);
+        assert_eq!(
+            rt.capability("+"),
+            Some(crate::Capability {
+                name: "+".to_owned(),
+                effect: EffectKind::Pure,
+            })
+        );
+
+        let caps = rt.capabilities();
+        assert_eq!(caps.len(), 2);
+        assert_eq!(caps[0].name, "+");
+        assert_eq!(caps[1].name, "clock");
 
         std::fs::remove_dir_all(temp)?;
         Ok(())

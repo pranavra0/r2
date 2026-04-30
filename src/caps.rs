@@ -5,9 +5,15 @@ use std::sync::Arc;
 pub type HostResult = Result<Value, FailureKind>;
 type HostImpl = dyn Fn(&[Value]) -> HostResult + Send + Sync + 'static;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Capability {
+    pub name: String,
+    pub effect: EffectKind,
+}
+
 #[derive(Clone)]
 pub struct HostFn {
-    pub effect: EffectKind,
+    effect: EffectKind,
     func: Arc<HostImpl>,
 }
 
@@ -36,6 +42,10 @@ impl HostFn {
     pub fn call(&self, args: &[Value]) -> HostResult {
         (self.func)(args)
     }
+
+    pub fn effect(&self) -> EffectKind {
+        self.effect.clone()
+    }
 }
 
 #[derive(Clone, Default)]
@@ -48,11 +58,36 @@ impl CapSet {
         Self::default()
     }
 
-    pub fn insert(&mut self, name: impl Into<String>, func: HostFn) {
-        self.funcs.insert(name.into(), func);
+    pub fn insert(&mut self, name: impl Into<String>, func: HostFn) -> Option<HostFn> {
+        self.funcs.insert(name.into(), func)
     }
 
     pub fn get(&self, name: &str) -> Option<&HostFn> {
         self.funcs.get(name)
+    }
+
+    pub fn contains(&self, name: &str) -> bool {
+        self.funcs.contains_key(name)
+    }
+
+    pub fn effect(&self, name: &str) -> Option<EffectKind> {
+        self.funcs.get(name).map(HostFn::effect)
+    }
+
+    pub fn capability(&self, name: &str) -> Option<Capability> {
+        self.funcs.get(name).map(|func| Capability {
+            name: name.to_owned(),
+            effect: func.effect(),
+        })
+    }
+
+    pub fn capabilities(&self) -> Vec<Capability> {
+        self.funcs
+            .iter()
+            .map(|(name, func)| Capability {
+                name: name.clone(),
+                effect: func.effect(),
+            })
+            .collect()
     }
 }

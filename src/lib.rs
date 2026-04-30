@@ -9,7 +9,7 @@ pub mod store;
 pub mod trace;
 pub mod value;
 
-pub use caps::{CapSet, HostFn};
+pub use caps::{CapSet, Capability, HostFn};
 pub use failure::{Failure, FailureKind};
 pub use hash::Hash;
 pub use node::{EffectKind, Node};
