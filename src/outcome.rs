@@ -7,6 +7,15 @@ pub enum Outcome {
     Failure(Failure),
 }
 
+impl Outcome {
+    pub fn is_cacheable(&self) -> bool {
+        match self {
+            Self::Success(_) => true,
+            Self::Failure(failure) => failure.kind.is_cacheable(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ForceResult {
     pub outcome: Outcome,

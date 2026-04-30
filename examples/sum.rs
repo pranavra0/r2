@@ -12,7 +12,8 @@ fn main() -> anyhow::Result<()> {
 
     let a = rt.int(20)?;
     let b = rt.int(22)?;
-    let sum = rt.call("+", vec![a, b])?;
+    let sum_expr = rt.call("+", vec![a, b])?;
+    let sum = rt.thunk(sum_expr)?;
 
     let first = rt.force(sum.clone())?;
     println!("first force: cache_hit={}", first.cache_hit);
@@ -32,7 +33,8 @@ fn print_outcome(rt: &Runtime, outcome: Outcome) -> anyhow::Result<()> {
             println!("success: {value:?}");
         }
         Outcome::Failure(failure) => {
-            println!("failure: {failure:?}");
+            println!("failure: {}", failure.kind);
+            print!("trace:\n{}", failure.trace);
         }
     }
 

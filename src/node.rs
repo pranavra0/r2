@@ -11,6 +11,9 @@ pub enum EffectKind {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Node {
     Value(Value),
+    Thunk {
+        target: Hash,
+    },
     Apply {
         function: String,
         args: Vec<Hash>,

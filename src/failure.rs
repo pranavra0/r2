@@ -1,4 +1,4 @@
-use crate::Hash;
+use crate::{GraphTrace, Hash};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
@@ -11,23 +11,27 @@ pub enum FailureKind {
     TypeError(String),
     #[error("missing object: {0}")]
     MissingObject(Hash),
+    #[error("cycle while forcing: {0}")]
+    Cycle(Hash),
     #[error("host function failed: {0}")]
     Host(String),
+}
+
+impl FailureKind {
+    pub fn is_cacheable(&self) -> bool {
+        !matches!(self, Self::UnknownCapability(_) | Self::PermissionDenied(_))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Failure {
     pub node: Hash,
     pub kind: FailureKind,
-    pub dependency_path: Vec<Hash>,
+    pub trace: GraphTrace,
 }
 
 impl Failure {
-    pub fn new(node: Hash, kind: FailureKind, dependency_path: Vec<Hash>) -> Self {
-        Self {
-            node,
-            kind,
-            dependency_path,
-        }
+    pub fn new(node: Hash, kind: FailureKind, trace: GraphTrace) -> Self {
+        Self { node, kind, trace }
     }
 }
