@@ -1,4 +1,4 @@
-use crate::{ActionSpec, Hash, Value};
+use crate::{ActionSpec, CellId, Hash, Value};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -24,4 +24,5 @@ pub enum Node {
         effect: EffectKind,
     },
     Action(ActionSpec),
+    ReadCell(CellId),
 }

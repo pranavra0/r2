@@ -1,4 +1,4 @@
-use r2::{Hash, Node, Outcome, Runtime, TreeEntry, Value};
+use r2::{CellId, Hash, Node, Outcome, Runtime, TreeEntry, Value};
 use std::str::FromStr;
 
 fn main() -> anyhow::Result<()> {
@@ -27,6 +27,7 @@ fn main() -> anyhow::Result<()> {
             println!("outcomes: {}", stats.outcome_count);
             println!("pins: {}", stats.root_count);
             println!("aliases: {}", stats.alias_count);
+            println!("cells: {}", stats.cell_count);
             println!("bytes: {}", stats.total_bytes);
         }
         "gc-plan" => {
@@ -86,6 +87,31 @@ fn main() -> anyhow::Result<()> {
             let hash = Hash::from_str(one_arg(&args, "inspect")?)?;
             inspect(&rt, &hash)?;
         }
+        "trace" => {
+            let hash = Hash::from_str(one_arg(&args, "trace")?)?;
+            print!("{}", rt.explain(&hash)?);
+        }
+        "cell-new" => {
+            let hash = Hash::from_str(one_arg(&args, "cell-new")?)?;
+            let id = rt.cell_new(hash)?;
+            println!("{}", id.0);
+        }
+        "cell-set" => {
+            if args.len() != 3 {
+                anyhow::bail!("cell-set expects CELL_ID HASH");
+            }
+            let id = CellId(args[1].clone());
+            let hash = Hash::from_str(&args[2])?;
+            let version = rt.cell_set(&id, hash)?;
+            println!("{} {}", version.index, version.value);
+        }
+        "cell-read" => {
+            let id = CellId(one_arg(&args, "cell-read")?.to_owned());
+            match rt.cell_current(&id)? {
+                Some(version) => println!("{} {}", version.index, version.value),
+                None => println!("not found"),
+            }
+        }
         _ => print_usage(),
     }
 
@@ -94,7 +120,7 @@ fn main() -> anyhow::Result<()> {
 
 fn print_usage() {
     println!(
-        "usage: r2 [--store PATH] <stats|gc-plan|gc|pin NAME HASH|unpin NAME|alias NAME HASH|unalias NAME|resolve NAME|export HASH DESTINATION|inspect HASH>"
+        "usage: r2 [--store PATH] <stats|gc-plan|gc|pin NAME HASH|unpin NAME|alias NAME HASH|unalias NAME|resolve NAME|export HASH DESTINATION|inspect HASH|trace HASH|cell-new HASH|cell-set CELL_ID HASH|cell-read CELL_ID>"
     );
 }
 
@@ -133,6 +159,9 @@ fn inspect(rt: &Runtime, hash: &Hash) -> anyhow::Result<()> {
                 for output in spec.outputs {
                     println!("    output {output}");
                 }
+            }
+            Node::ReadCell(id) => {
+                println!("  read-cell {}", id.0);
             }
         }
     }

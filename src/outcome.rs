@@ -1,10 +1,17 @@
-use crate::{Failure, Hash};
+use crate::{CellId, Failure, Hash};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Outcome {
     Success(Hash),
     Failure(Failure),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CachedOutcome {
+    pub outcome: Outcome,
+    pub observed_cells: BTreeMap<CellId, u64>,
 }
 
 impl Outcome {

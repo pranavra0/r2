@@ -30,13 +30,18 @@ pub enum FailureKind {
     },
     #[error("action output missing: {0}")]
     MissingActionOutput(String),
+    #[error("unknown cell: {0}")]
+    UnknownCell(String),
 }
 
 impl FailureKind {
     pub fn is_cacheable(&self) -> bool {
         !matches!(
             self,
-            Self::UnknownCapability(_) | Self::PermissionDenied(_) | Self::EffectMismatch { .. }
+            Self::UnknownCapability(_)
+                | Self::PermissionDenied(_)
+                | Self::EffectMismatch { .. }
+                | Self::UnknownCell(_)
         )
     }
 }

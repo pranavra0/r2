@@ -1,6 +1,7 @@
 use crate::{
-    ActionSpec, CapSet, EffectKind, Failure, FailureKind, ForceResult, GcPlan, GcReport,
-    GraphTrace, Hash, HostFn, Node, Outcome, Store, StoreStats, Tree, TreeEntry, Value,
+    ActionSpec, CachedOutcome, CapSet, CellId, CellVersion, EffectKind, Failure, FailureKind,
+    ForceResult, GcPlan, GcReport, GraphTrace, Hash, HostFn, Node, Outcome, Store, StoreStats,
+    Tree, TreeEntry, Value,
 };
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -10,6 +11,19 @@ use std::process::Command;
 pub struct Runtime {
     store: Store,
     caps: CapSet,
+}
+
+fn value_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Int(_) => "int",
+        Value::Text(_) => "text",
+        Value::Bytes(_) => "bytes",
+        Value::Blob(_) => "blob",
+        Value::Tree(_) => "tree",
+        Value::Tuple(_) => "tuple",
+        Value::Artifact(_) => "artifact",
+        Value::ActionResult { .. } => "action-result",
+    }
 }
 
 impl Runtime {
@@ -161,13 +175,30 @@ impl Runtime {
         self.store.put_node(&Node::Action(spec))
     }
 
+    pub fn cell_new(&self, initial: Hash) -> anyhow::Result<CellId> {
+        self.store.cell_new(initial)
+    }
+
+    pub fn cell_set(&self, id: &CellId, value: Hash) -> anyhow::Result<CellVersion> {
+        self.store.cell_set(id, value)
+    }
+
+    pub fn cell_current(&self, id: &CellId) -> anyhow::Result<Option<CellVersion>> {
+        self.store.cell_current(id)
+    }
+
+    pub fn read_cell(&self, id: CellId) -> anyhow::Result<Hash> {
+        self.store.put_node(&Node::ReadCell(id))
+    }
+
     pub fn thunk(&self, target: Hash) -> anyhow::Result<Hash> {
         self.store.put_node(&Node::Thunk { target })
     }
 
     pub fn force(&self, node: Hash) -> anyhow::Result<ForceResult> {
         if self.node_is_cacheable(&node, &mut BTreeSet::new())?
-            && let Some(outcome) = self.store.get_outcome(&node)?
+            && let Some(cached) = self.store.get_cached_outcome(&node)?
+            && self.cached_outcome_is_fresh(&cached)?
         {
             if let Some(failure) = self.validate_authority(&node)? {
                 return Ok(ForceResult {
@@ -177,14 +208,21 @@ impl Runtime {
             }
 
             return Ok(ForceResult {
-                outcome,
+                outcome: cached.outcome,
                 cache_hit: true,
             });
         }
 
-        let outcome = self.eval(&node, &mut GraphTrace::default())?;
+        let mut observed_cells = BTreeMap::new();
+        let outcome = self.eval(&node, &mut GraphTrace::default(), &mut observed_cells)?;
         if self.should_cache(&node, &outcome)? {
-            self.store.put_outcome(&node, &outcome)?;
+            self.store.put_outcome(
+                &node,
+                &CachedOutcome {
+                    outcome: outcome.clone(),
+                    observed_cells,
+                },
+            )?;
         }
         Ok(ForceResult {
             outcome,
@@ -261,6 +299,109 @@ impl Runtime {
         self.store.gc()
     }
 
+    pub fn explain(&self, hash: &Hash) -> anyhow::Result<String> {
+        let mut out = String::new();
+        self.explain_hash(hash, &mut out, 0)?;
+        Ok(out)
+    }
+
+    fn explain_hash(&self, hash: &Hash, out: &mut String, indent: usize) -> anyhow::Result<()> {
+        let pad = " ".repeat(indent);
+        if let Some(node) = self.get_node(hash)? {
+            match node {
+                Node::Value(value) => {
+                    out.push_str(&format!("{pad}{hash} value-node {}\n", value_kind(&value)));
+                }
+                Node::Thunk { target } => {
+                    out.push_str(&format!("{pad}{hash} thunk\n"));
+                    self.explain_hash(&target, out, indent + 2)?;
+                }
+                Node::Apply { function, args } => {
+                    out.push_str(&format!("{pad}{hash} apply {function}\n"));
+                    for arg in args {
+                        self.explain_hash(&arg, out, indent + 2)?;
+                    }
+                }
+                Node::HostCall {
+                    capability,
+                    args,
+                    effect,
+                } => {
+                    out.push_str(&format!("{pad}{hash} host-call {capability} {effect:?}\n"));
+                    for arg in args {
+                        self.explain_hash(&arg, out, indent + 2)?;
+                    }
+                }
+                Node::Action(spec) => {
+                    out.push_str(&format!("{pad}{hash} action {}\n", spec.program));
+                    out.push_str(&format!("{pad}  tool {}\n", spec.tool));
+                    out.push_str(&format!("{pad}  platform {}\n", spec.platform));
+                    for input in spec.inputs {
+                        out.push_str(&format!("{pad}  input {} {}\n", input.path, input.hash));
+                    }
+                    for output in spec.outputs {
+                        out.push_str(&format!("{pad}  output {output}\n"));
+                    }
+                }
+                Node::ReadCell(id) => {
+                    out.push_str(&format!("{pad}{hash} read-cell {}\n", id.0));
+                    if let Some(version) = self.store.cell_current(&id)? {
+                        out.push_str(&format!(
+                            "{pad}  current version {} {}\n",
+                            version.index, version.value
+                        ));
+                        self.explain_hash(&version.value, out, indent + 2)?;
+                    }
+                }
+            }
+        } else if let Ok(value) = self.get_value(hash) {
+            out.push_str(&format!("{pad}{hash} value {}\n", value_kind(&value)));
+            if let Value::ActionResult {
+                outputs,
+                stdout,
+                stderr,
+            } = value
+            {
+                out.push_str(&format!("{pad}  outputs {outputs}\n"));
+                out.push_str(&format!("{pad}  stdout {stdout}\n"));
+                out.push_str(&format!("{pad}  stderr {stderr}\n"));
+            }
+        } else {
+            out.push_str(&format!("{pad}{hash} missing\n"));
+        }
+
+        if let Some(cached) = self.store.get_cached_outcome(hash)? {
+            match cached.outcome {
+                Outcome::Success(value) => {
+                    out.push_str(&format!("{pad}=> success {value}\n"));
+                }
+                Outcome::Failure(failure) => {
+                    out.push_str(&format!("{pad}=> failure {}\n", failure.kind));
+                    out.push_str(&format!("{pad}trace:\n"));
+                    for step in failure.trace.hashes() {
+                        out.push_str(&format!("{pad}  -> {step}\n"));
+                    }
+                    if let FailureKind::ActionFailed { stdout, stderr, .. } = failure.kind {
+                        if !stdout.is_empty() {
+                            out.push_str(&format!("{pad}stdout:\n{stdout}\n"));
+                        }
+                        if !stderr.is_empty() {
+                            out.push_str(&format!("{pad}stderr:\n{stderr}\n"));
+                        }
+                    }
+                }
+            }
+            if !cached.observed_cells.is_empty() {
+                out.push_str(&format!("{pad}observed cells:\n"));
+                for (cell, version) in cached.observed_cells {
+                    out.push_str(&format!("{pad}  {} @ {}\n", cell.0, version));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     fn import_tree_inner(&self, path: &Path) -> anyhow::Result<Hash> {
         let mut entries = BTreeMap::new();
         for entry in std::fs::read_dir(path)? {
@@ -320,7 +461,12 @@ impl Runtime {
         Ok(())
     }
 
-    fn eval(&self, node_hash: &Hash, trace: &mut GraphTrace) -> anyhow::Result<Outcome> {
+    fn eval(
+        &self,
+        node_hash: &Hash,
+        trace: &mut GraphTrace,
+        observed_cells: &mut BTreeMap<CellId, u64>,
+    ) -> anyhow::Result<Outcome> {
         if trace.contains(node_hash) {
             return Ok(Outcome::Failure(Failure::new(
                 node_hash.clone(),
@@ -346,16 +492,35 @@ impl Runtime {
                 let value_hash = self.store.put_value(&value)?;
                 Outcome::Success(value_hash)
             }
-            Node::Thunk { target } => self.force_dependency(&target, trace)?,
-            Node::Apply { function, args } => {
-                self.eval_apply(node_hash, &function, &args, EffectKind::Pure, trace)?
-            }
+            Node::Thunk { target } => self.force_dependency(&target, trace, observed_cells)?,
+            Node::Apply { function, args } => self.eval_apply(
+                node_hash,
+                &function,
+                &args,
+                EffectKind::Pure,
+                trace,
+                observed_cells,
+            )?,
             Node::HostCall {
                 capability,
                 args,
                 effect,
-            } => self.eval_apply(node_hash, &capability, &args, effect, trace)?,
-            Node::Action(spec) => self.eval_action(node_hash, &spec, trace)?,
+            } => self.eval_apply(node_hash, &capability, &args, effect, trace, observed_cells)?,
+            Node::Action(spec) => self.eval_action(node_hash, &spec, trace, observed_cells)?,
+            Node::ReadCell(id) => {
+                let Some(version) = self.store.cell_current(&id)? else {
+                    return Ok(Outcome::Failure(Failure::new(
+                        node_hash.clone(),
+                        FailureKind::UnknownCell(id.0),
+                        trace.clone(),
+                    )));
+                };
+                observed_cells.insert(id, version.index);
+                match self.force_dependency(&version.value, trace, observed_cells)? {
+                    Outcome::Success(value) => Outcome::Success(value),
+                    Outcome::Failure(failure) => Outcome::Failure(failure),
+                }
+            }
         };
 
         trace.pop();
@@ -369,6 +534,7 @@ impl Runtime {
         args: &[Hash],
         requested_effect: EffectKind,
         trace: &mut GraphTrace,
+        observed_cells: &mut BTreeMap<CellId, u64>,
     ) -> anyhow::Result<Outcome> {
         let Some(cap) = self.caps.get(function) else {
             return Ok(Outcome::Failure(Failure::new(
@@ -393,7 +559,7 @@ impl Runtime {
 
         let mut values = Vec::with_capacity(args.len());
         for arg in args {
-            match self.force_dependency(arg, trace)? {
+            match self.force_dependency(arg, trace, observed_cells)? {
                 Outcome::Success(value_hash) => {
                     let Some(value) = self.store.get_value(&value_hash)? else {
                         return Ok(Outcome::Failure(Failure::new(
@@ -426,11 +592,12 @@ impl Runtime {
         node_hash: &Hash,
         spec: &ActionSpec,
         trace: &mut GraphTrace,
+        observed_cells: &mut BTreeMap<CellId, u64>,
     ) -> anyhow::Result<Outcome> {
         let workspace = self.new_workspace()?;
         for input in &spec.inputs {
             let destination = workspace.join(&input.path);
-            self.materialize_hash(&input.hash, &destination, trace)?;
+            self.materialize_hash(&input.hash, &destination, trace, observed_cells)?;
         }
 
         let output = Command::new(&spec.program)
@@ -506,8 +673,9 @@ impl Runtime {
         hash: &Hash,
         destination: &Path,
         trace: &mut GraphTrace,
+        observed_cells: &mut BTreeMap<CellId, u64>,
     ) -> anyhow::Result<()> {
-        let outcome = self.force_dependency(hash, trace)?;
+        let outcome = self.force_dependency(hash, trace, observed_cells)?;
         let Outcome::Success(value_hash) = outcome else {
             anyhow::bail!("cannot materialize failed input {hash}");
         };
@@ -553,21 +721,48 @@ impl Runtime {
         Ok(path)
     }
 
-    fn force_dependency(&self, node: &Hash, trace: &mut GraphTrace) -> anyhow::Result<Outcome> {
+    fn force_dependency(
+        &self,
+        node: &Hash,
+        trace: &mut GraphTrace,
+        observed_cells: &mut BTreeMap<CellId, u64>,
+    ) -> anyhow::Result<Outcome> {
         if self.node_is_cacheable(node, &mut BTreeSet::new())?
-            && let Some(outcome) = self.store.get_outcome(node)?
+            && let Some(cached) = self.store.get_cached_outcome(node)?
+            && self.cached_outcome_is_fresh(&cached)?
         {
             if let Some(failure) = self.validate_authority_with_trace(node, trace.clone())? {
                 return Ok(Outcome::Failure(failure));
             }
-            return Ok(self.with_current_trace(outcome, trace));
+            observed_cells.extend(cached.observed_cells.clone());
+            return Ok(self.with_current_trace(cached.outcome, trace));
         }
 
-        let outcome = self.eval(node, trace)?;
+        let mut dependency_observed_cells = BTreeMap::new();
+        let outcome = self.eval(node, trace, &mut dependency_observed_cells)?;
+        observed_cells.extend(dependency_observed_cells.clone());
         if self.should_cache(node, &outcome)? {
-            self.store.put_outcome(node, &outcome)?;
+            self.store.put_outcome(
+                node,
+                &CachedOutcome {
+                    outcome: outcome.clone(),
+                    observed_cells: dependency_observed_cells,
+                },
+            )?;
         }
         Ok(outcome)
+    }
+
+    fn cached_outcome_is_fresh(&self, cached: &CachedOutcome) -> anyhow::Result<bool> {
+        for (cell, observed) in &cached.observed_cells {
+            let Some(current) = self.store.cell_current(cell)? else {
+                return Ok(false);
+            };
+            if current.index != *observed {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     fn with_current_trace(&self, outcome: Outcome, trace: &GraphTrace) -> Outcome {
@@ -673,6 +868,17 @@ impl Runtime {
                 }
             }
             Node::Action(spec) => self.validate_action_authority(&spec, trace, visited)?,
+            Node::ReadCell(id) => {
+                if let Some(version) = self.store.cell_current(&id)? {
+                    self.validate_authority_inner(&version.value, trace, visited)?
+                } else {
+                    Some(Failure::new(
+                        node_hash.clone(),
+                        FailureKind::UnknownCell(id.0),
+                        trace.clone(),
+                    ))
+                }
+            }
         };
 
         trace.pop();
@@ -750,6 +956,7 @@ impl Runtime {
                 }
                 Ok(true)
             }
+            Node::ReadCell(_) => Ok(true),
         }
     }
 
@@ -1363,6 +1570,73 @@ mod tests {
     }
 
     #[test]
+    fn cells_update_derived_computations() -> anyhow::Result<()> {
+        let temp = temp_store()?;
+
+        let mut rt = Runtime::new(&temp)?;
+        rt.register("+", HostFn::pure(add_ints));
+
+        let initial = rt.int(100)?;
+        let cell = rt.cell_new(initial)?;
+        let read = rt.read_cell(cell.clone())?;
+        let one = rt.int(1)?;
+        let derived = rt.call("+", vec![read.clone(), one])?;
+
+        let first = rt.force(derived.clone())?;
+        assert!(!first.cache_hit);
+        let Outcome::Success(first_hash) = first.outcome else {
+            panic!("derived computation should succeed");
+        };
+        assert_eq!(rt.get_value(&first_hash)?, Value::Int(101));
+
+        let second = rt.force(derived.clone())?;
+        assert!(second.cache_hit);
+        let Outcome::Success(second_hash) = second.outcome else {
+            panic!("derived computation should succeed from cache");
+        };
+        assert_eq!(rt.get_value(&second_hash)?, Value::Int(101));
+        let explanation = rt.explain(&derived)?;
+        assert!(explanation.contains("observed cells:"));
+        assert!(explanation.contains("@ 0"));
+
+        let updated = rt.int(200)?;
+        let version = rt.cell_set(&cell, updated)?;
+        assert_eq!(version.index, 1);
+
+        let third = rt.force(derived)?;
+        assert!(!third.cache_hit);
+        let Outcome::Success(third_hash) = third.outcome else {
+            panic!("derived computation should recompute after cell update");
+        };
+        assert_eq!(rt.get_value(&third_hash)?, Value::Int(201));
+        assert_eq!(rt.cell_current(&cell)?.unwrap().index, 1);
+
+        std::fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn cells_keep_current_values_reachable_for_gc() -> anyhow::Result<()> {
+        let temp = temp_store()?;
+
+        let rt = Runtime::new(&temp)?;
+        let initial = rt.int(1)?;
+        let cell = rt.cell_new(initial.clone())?;
+        let updated = rt.int(2)?;
+        rt.cell_set(&cell, updated.clone())?;
+
+        let plan = rt.gc_plan()?;
+        assert!(plan.reachable_objects.contains(&updated));
+        assert!(plan.unreachable_objects.contains(&initial));
+
+        let stats = rt.store_stats()?;
+        assert_eq!(stats.cell_count, 1);
+
+        std::fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
     fn hermetic_action_runs_with_declared_inputs_and_caches_output_tree() -> anyhow::Result<()> {
         let temp = temp_store()?;
         let source_dir = temp.join("src");
@@ -1452,6 +1726,33 @@ mod tests {
         assert_eq!(program, "/bin/cp");
         assert_ne!(status, "0");
         assert!(stderr.contains("missing.txt"));
+
+        std::fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn explain_includes_failure_trace_and_action_stderr() -> anyhow::Result<()> {
+        let temp = temp_store()?;
+        let rt = Runtime::new(temp.join("store"))?;
+        let cp = rt.import_tool("/bin/cp")?;
+        let action = rt.action(ActionSpec {
+            program: "/bin/cp".to_owned(),
+            tool: cp,
+            args: vec!["missing.txt".to_owned(), "out.txt".to_owned()],
+            env: BTreeMap::new(),
+            platform: std::env::consts::OS.to_owned(),
+            inputs: vec![],
+            outputs: vec!["out.txt".to_owned()],
+        })?;
+
+        let forced = rt.force(action.clone())?;
+        assert!(matches!(forced.outcome, Outcome::Failure(_)));
+        let explanation = rt.explain(&action)?;
+        assert!(explanation.contains("action /bin/cp"));
+        assert!(explanation.contains("=> failure"));
+        assert!(explanation.contains("stderr:"));
+        assert!(explanation.contains("missing.txt"));
 
         std::fs::remove_dir_all(temp)?;
         Ok(())

@@ -1,5 +1,7 @@
 use crate::encode;
-use crate::{ActionInput, Hash, Node, Outcome, TreeEntry, Value};
+use crate::{
+    ActionInput, CachedOutcome, CellId, CellVersion, Hash, Node, Outcome, TreeEntry, Value,
+};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -18,6 +20,7 @@ pub struct StoreStats {
     pub outcome_count: u64,
     pub root_count: u64,
     pub alias_count: u64,
+    pub cell_count: u64,
     pub total_bytes: u64,
 }
 
@@ -62,11 +65,15 @@ impl Store {
         self.get_object(hash, ObjectKind::Value)
     }
 
-    pub fn put_outcome(&self, node: &Hash, outcome: &Outcome) -> anyhow::Result<()> {
-        self.put_at(&self.outcome_path(node), outcome)
+    pub fn put_outcome(&self, node: &Hash, outcome: &CachedOutcome) -> anyhow::Result<()> {
+        self.replace_at(&self.outcome_path(node), outcome)
     }
 
     pub fn get_outcome(&self, node: &Hash) -> anyhow::Result<Option<Outcome>> {
+        Ok(self.get_cached_outcome(node)?.map(|cached| cached.outcome))
+    }
+
+    pub fn get_cached_outcome(&self, node: &Hash) -> anyhow::Result<Option<CachedOutcome>> {
         self.get_at(&self.outcome_path(node))
     }
 
@@ -112,20 +119,74 @@ impl Store {
         Ok(self.load_aliases()?.names)
     }
 
+    pub fn cell_new(&self, initial: Hash) -> anyhow::Result<CellId> {
+        let mut cells = self.load_cells()?;
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos()
+            .to_le_bytes();
+        let id = CellId(Hash::new("cell", &nonce).to_string());
+        cells.versions.entry(id.clone()).or_insert_with(|| {
+            vec![CellVersion {
+                index: 0,
+                value: initial,
+            }]
+        });
+        self.save_cells(&cells)?;
+        Ok(id)
+    }
+
+    pub fn cell_set(&self, id: &CellId, value: Hash) -> anyhow::Result<CellVersion> {
+        let mut cells = self.load_cells()?;
+        let Some(versions) = cells.versions.get_mut(id) else {
+            anyhow::bail!("unknown cell {}", id.0);
+        };
+        let version = CellVersion {
+            index: versions
+                .last()
+                .map(|version| version.index + 1)
+                .unwrap_or(0),
+            value,
+        };
+        versions.push(version.clone());
+        self.save_cells(&cells)?;
+        Ok(version)
+    }
+
+    pub fn cell_current(&self, id: &CellId) -> anyhow::Result<Option<CellVersion>> {
+        Ok(self
+            .load_cells()?
+            .versions
+            .get(id)
+            .and_then(|versions| versions.last())
+            .cloned())
+    }
+
+    pub fn cells(&self) -> anyhow::Result<BTreeMap<CellId, Vec<CellVersion>>> {
+        Ok(self.load_cells()?.versions)
+    }
+
     pub fn stats(&self) -> anyhow::Result<StoreStats> {
         let object_stats = dir_stats(&self.root.join("objects"))?;
         let outcome_stats = dir_stats(&self.root.join("outcomes"))?;
         let roots_bytes = file_len(&self.roots_path())?;
         let aliases_bytes = file_len(&self.aliases_path())?;
+        let cells_bytes = file_len(&self.cells_path())?;
         let root_count = self.load_roots()?.pins.len() as u64;
         let alias_count = self.load_aliases()?.names.len() as u64;
+        let cell_count = self.load_cells()?.versions.len() as u64;
 
         Ok(StoreStats {
             object_count: object_stats.files,
             outcome_count: outcome_stats.files,
             root_count,
             alias_count,
-            total_bytes: object_stats.bytes + outcome_stats.bytes + roots_bytes + aliases_bytes,
+            cell_count,
+            total_bytes: object_stats.bytes
+                + outcome_stats.bytes
+                + roots_bytes
+                + aliases_bytes
+                + cells_bytes,
         })
     }
 
@@ -136,6 +197,15 @@ impl Store {
 
         for hash in roots.values() {
             self.mark_reachable_object(hash, &mut reachable_objects, &mut reachable_outcomes)?;
+        }
+        for versions in self.cells()?.values() {
+            if let Some(version) = versions.last() {
+                self.mark_reachable_object(
+                    &version.value,
+                    &mut reachable_objects,
+                    &mut reachable_outcomes,
+                )?;
+            }
         }
 
         let all_objects = self.object_hashes()?;
@@ -290,6 +360,15 @@ impl Store {
                     self.mark_reachable_object(hash, reachable_objects, reachable_outcomes)?;
                 }
             }
+            Node::ReadCell(cell) => {
+                if let Some(version) = self.cell_current(cell)? {
+                    self.mark_reachable_object(
+                        &version.value,
+                        reachable_objects,
+                        reachable_outcomes,
+                    )?;
+                }
+            }
         }
 
         Ok(())
@@ -403,6 +482,10 @@ impl Store {
         self.root.join("aliases.r2")
     }
 
+    fn cells_path(&self) -> PathBuf {
+        self.root.join("cells.r2")
+    }
+
     fn object_hashes(&self) -> anyhow::Result<BTreeSet<Hash>> {
         collect_hashes(&self.root.join("objects"), "r2obj")
     }
@@ -425,6 +508,14 @@ impl Store {
 
     fn save_aliases(&self, aliases: &AliasesFile) -> anyhow::Result<()> {
         self.replace_at(&self.aliases_path(), aliases)
+    }
+
+    fn load_cells(&self) -> anyhow::Result<CellsFile> {
+        Ok(self.get_at(&self.cells_path())?.unwrap_or_default())
+    }
+
+    fn save_cells(&self, cells: &CellsFile) -> anyhow::Result<()> {
+        self.replace_at(&self.cells_path(), cells)
     }
 }
 
@@ -475,6 +566,12 @@ struct RootsFile {
 struct AliasesFile {
     schema: u32,
     names: BTreeMap<String, Hash>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct CellsFile {
+    schema: u32,
+    versions: BTreeMap<CellId, Vec<CellVersion>>,
 }
 
 #[derive(Default)]
