@@ -15,6 +15,6 @@ pub use hash::Hash;
 pub use node::{EffectKind, Node};
 pub use outcome::{ForceResult, Outcome};
 pub use runtime::Runtime;
-pub use store::Store;
+pub use store::{GcPlan, Store, StoreStats};
 pub use trace::GraphTrace;
 pub use value::Value;

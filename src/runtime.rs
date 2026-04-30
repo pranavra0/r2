@@ -1,6 +1,6 @@
 use crate::{
-    CapSet, EffectKind, Failure, FailureKind, ForceResult, GraphTrace, Hash, HostFn, Node, Outcome,
-    Store, Value,
+    CapSet, EffectKind, Failure, FailureKind, ForceResult, GcPlan, GraphTrace, Hash, HostFn, Node,
+    Outcome, Store, StoreStats, Value,
 };
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -129,6 +129,46 @@ impl Runtime {
         self.store
             .get_value(hash)?
             .ok_or_else(|| anyhow::anyhow!("missing value {hash}"))
+    }
+
+    pub fn pin(&self, name: impl Into<String>, hash: Hash) -> anyhow::Result<()> {
+        self.store.pin(name, hash)
+    }
+
+    pub fn unpin(&self, name: &str) -> anyhow::Result<Option<Hash>> {
+        self.store.unpin(name)
+    }
+
+    pub fn resolve_pin(&self, name: &str) -> anyhow::Result<Option<Hash>> {
+        self.store.resolve_pin(name)
+    }
+
+    pub fn pins(&self) -> anyhow::Result<std::collections::BTreeMap<String, Hash>> {
+        self.store.pins()
+    }
+
+    pub fn alias(&self, name: impl Into<String>, hash: Hash) -> anyhow::Result<()> {
+        self.store.alias(name, hash)
+    }
+
+    pub fn unalias(&self, name: &str) -> anyhow::Result<Option<Hash>> {
+        self.store.unalias(name)
+    }
+
+    pub fn resolve_alias(&self, name: &str) -> anyhow::Result<Option<Hash>> {
+        self.store.resolve_alias(name)
+    }
+
+    pub fn aliases(&self) -> anyhow::Result<std::collections::BTreeMap<String, Hash>> {
+        self.store.aliases()
+    }
+
+    pub fn store_stats(&self) -> anyhow::Result<StoreStats> {
+        self.store.stats()
+    }
+
+    pub fn gc_plan(&self) -> anyhow::Result<GcPlan> {
+        self.store.gc_plan()
     }
 
     fn eval(&self, node_hash: &Hash, trace: &mut GraphTrace) -> anyhow::Result<Outcome> {
@@ -578,6 +618,102 @@ mod tests {
     }
 
     #[test]
+    fn pins_persist_across_runtime_instances() -> anyhow::Result<()> {
+        let temp = temp_store()?;
+
+        let sum = {
+            let mut rt = Runtime::new(&temp)?;
+            rt.register("+", HostFn::pure(add_ints));
+
+            let a = rt.int(20)?;
+            let b = rt.int(22)?;
+            let sum_expr = rt.call("+", vec![a, b])?;
+            let sum = rt.thunk(sum_expr)?;
+            rt.pin("demo.sum", sum.clone())?;
+            sum
+        };
+
+        let rt = Runtime::new(&temp)?;
+        assert_eq!(rt.resolve_pin("demo.sum")?, Some(sum.clone()));
+        assert_eq!(rt.resolve_pin("missing")?, None);
+        assert_eq!(rt.pins()?.get("demo.sum"), Some(&sum));
+
+        let removed = rt.unpin("demo.sum")?;
+        assert_eq!(removed, Some(sum));
+        assert_eq!(rt.resolve_pin("demo.sum")?, None);
+
+        std::fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn aliases_persist_and_are_distinct_from_pins() -> anyhow::Result<()> {
+        let temp = temp_store()?;
+
+        let (first_sum, second_sum) = {
+            let mut rt = Runtime::new(&temp)?;
+            rt.register("+", HostFn::pure(add_ints));
+
+            let a = rt.int(20)?;
+            let b = rt.int(22)?;
+            let first_expr = rt.call("+", vec![a.clone(), b.clone()])?;
+            let first_sum = rt.thunk(first_expr)?;
+
+            let c = rt.int(1)?;
+            let second_expr = rt.call("+", vec![first_sum.clone(), c])?;
+            let second_sum = rt.thunk(second_expr)?;
+
+            rt.alias("demo.sum", first_sum.clone())?;
+            assert_eq!(rt.resolve_alias("demo.sum")?, Some(first_sum.clone()));
+            assert_eq!(rt.resolve_pin("demo.sum")?, None);
+
+            rt.alias("demo.sum", second_sum.clone())?;
+            (first_sum, second_sum)
+        };
+
+        let rt = Runtime::new(&temp)?;
+        assert_eq!(rt.resolve_alias("demo.sum")?, Some(second_sum.clone()));
+        assert_eq!(rt.aliases()?.get("demo.sum"), Some(&second_sum));
+        assert_eq!(rt.resolve_pin("demo.sum")?, None);
+
+        let removed = rt.unalias("demo.sum")?;
+        assert_eq!(removed.as_ref(), Some(&second_sum));
+        assert_eq!(rt.resolve_alias("demo.sum")?, None);
+        assert_eq!(rt.resolve_pin("demo.sum")?, None);
+        assert_ne!(first_sum, second_sum);
+
+        std::fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn reports_store_stats() -> anyhow::Result<()> {
+        let temp = temp_store()?;
+
+        let mut rt = Runtime::new(&temp)?;
+        rt.register("+", HostFn::pure(add_ints));
+
+        let a = rt.int(20)?;
+        let b = rt.int(22)?;
+        let sum_expr = rt.call("+", vec![a, b])?;
+        let sum = rt.thunk(sum_expr)?;
+        rt.force(sum.clone())?;
+        rt.pin("demo.sum", sum)?;
+        let alias_target = rt.int(7)?;
+        rt.alias("demo.seven", alias_target)?;
+
+        let stats = rt.store_stats()?;
+        assert!(stats.object_count >= 5);
+        assert!(stats.outcome_count >= 1);
+        assert_eq!(stats.root_count, 1);
+        assert_eq!(stats.alias_count, 1);
+        assert!(stats.total_bytes > 0);
+
+        std::fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
     fn rejects_object_kind_mismatch() -> anyhow::Result<()> {
         let temp = temp_store()?;
 
@@ -711,6 +847,55 @@ mod tests {
                 actual: EffectKind::Pure,
             }
         );
+
+        std::fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn gc_plan_traces_reachable_graph_from_pins() -> anyhow::Result<()> {
+        let temp = temp_store()?;
+
+        let mut rt = Runtime::new(&temp)?;
+        rt.register("+", HostFn::pure(add_ints));
+
+        let a = rt.int(20)?;
+        let b = rt.int(22)?;
+        let sum_expr = rt.call("+", vec![a.clone(), b.clone()])?;
+        let sum = rt.thunk(sum_expr.clone())?;
+        let forced = rt.force(sum.clone())?;
+        let Outcome::Success(value_hash) = forced.outcome else {
+            panic!("sum should succeed");
+        };
+        rt.pin("demo.sum", sum.clone())?;
+
+        let plan = rt.gc_plan()?;
+        assert_eq!(plan.roots.get("demo.sum"), Some(&sum));
+        assert!(plan.reachable_objects.contains(&sum));
+        assert!(plan.reachable_objects.contains(&sum_expr));
+        assert!(plan.reachable_objects.contains(&a));
+        assert!(plan.reachable_objects.contains(&b));
+        assert!(plan.reachable_objects.contains(&value_hash));
+        assert!(plan.reachable_outcomes.contains(&sum));
+        assert!(!plan.unreachable_objects.contains(&sum));
+        assert!(!plan.unreachable_outcomes.contains(&sum));
+
+        std::fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn gc_plan_does_not_treat_aliases_as_roots() -> anyhow::Result<()> {
+        let temp = temp_store()?;
+
+        let rt = Runtime::new(&temp)?;
+        let value = rt.int(7)?;
+        rt.alias("demo.seven", value.clone())?;
+
+        let plan = rt.gc_plan()?;
+        assert_eq!(plan.roots.get("demo.seven"), None);
+        assert!(!plan.reachable_objects.contains(&value));
+        assert!(plan.unreachable_objects.contains(&value));
 
         std::fs::remove_dir_all(temp)?;
         Ok(())

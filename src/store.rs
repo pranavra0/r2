@@ -2,12 +2,32 @@ use crate::encode;
 use crate::{Hash, Node, Outcome, Value};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 #[derive(Clone, Debug)]
 pub struct Store {
     root: PathBuf,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StoreStats {
+    pub object_count: u64,
+    pub outcome_count: u64,
+    pub root_count: u64,
+    pub alias_count: u64,
+    pub total_bytes: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GcPlan {
+    pub roots: BTreeMap<String, Hash>,
+    pub reachable_objects: BTreeSet<Hash>,
+    pub reachable_outcomes: BTreeSet<Hash>,
+    pub unreachable_objects: BTreeSet<Hash>,
+    pub unreachable_outcomes: BTreeSet<Hash>,
 }
 
 impl Store {
@@ -40,6 +60,94 @@ impl Store {
 
     pub fn get_outcome(&self, node: &Hash) -> anyhow::Result<Option<Outcome>> {
         self.get_at(&self.outcome_path(node))
+    }
+
+    pub fn pin(&self, name: impl Into<String>, hash: Hash) -> anyhow::Result<()> {
+        let mut roots = self.load_roots()?;
+        roots.pins.insert(name.into(), hash);
+        self.save_roots(&roots)
+    }
+
+    pub fn unpin(&self, name: &str) -> anyhow::Result<Option<Hash>> {
+        let mut roots = self.load_roots()?;
+        let removed = roots.pins.remove(name);
+        self.save_roots(&roots)?;
+        Ok(removed)
+    }
+
+    pub fn resolve_pin(&self, name: &str) -> anyhow::Result<Option<Hash>> {
+        Ok(self.load_roots()?.pins.get(name).cloned())
+    }
+
+    pub fn pins(&self) -> anyhow::Result<BTreeMap<String, Hash>> {
+        Ok(self.load_roots()?.pins)
+    }
+
+    pub fn alias(&self, name: impl Into<String>, hash: Hash) -> anyhow::Result<()> {
+        let mut aliases = self.load_aliases()?;
+        aliases.names.insert(name.into(), hash);
+        self.save_aliases(&aliases)
+    }
+
+    pub fn unalias(&self, name: &str) -> anyhow::Result<Option<Hash>> {
+        let mut aliases = self.load_aliases()?;
+        let removed = aliases.names.remove(name);
+        self.save_aliases(&aliases)?;
+        Ok(removed)
+    }
+
+    pub fn resolve_alias(&self, name: &str) -> anyhow::Result<Option<Hash>> {
+        Ok(self.load_aliases()?.names.get(name).cloned())
+    }
+
+    pub fn aliases(&self) -> anyhow::Result<BTreeMap<String, Hash>> {
+        Ok(self.load_aliases()?.names)
+    }
+
+    pub fn stats(&self) -> anyhow::Result<StoreStats> {
+        let object_stats = dir_stats(&self.root.join("objects"))?;
+        let outcome_stats = dir_stats(&self.root.join("outcomes"))?;
+        let roots_bytes = file_len(&self.roots_path())?;
+        let aliases_bytes = file_len(&self.aliases_path())?;
+        let root_count = self.load_roots()?.pins.len() as u64;
+        let alias_count = self.load_aliases()?.names.len() as u64;
+
+        Ok(StoreStats {
+            object_count: object_stats.files,
+            outcome_count: outcome_stats.files,
+            root_count,
+            alias_count,
+            total_bytes: object_stats.bytes + outcome_stats.bytes + roots_bytes + aliases_bytes,
+        })
+    }
+
+    pub fn gc_plan(&self) -> anyhow::Result<GcPlan> {
+        let roots = self.pins()?;
+        let mut reachable_objects = BTreeSet::new();
+        let mut reachable_outcomes = BTreeSet::new();
+
+        for hash in roots.values() {
+            self.mark_reachable_object(hash, &mut reachable_objects, &mut reachable_outcomes)?;
+        }
+
+        let all_objects = self.object_hashes()?;
+        let all_outcomes = self.outcome_hashes()?;
+        let unreachable_objects = all_objects
+            .difference(&reachable_objects)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let unreachable_outcomes = all_outcomes
+            .difference(&reachable_outcomes)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+
+        Ok(GcPlan {
+            roots,
+            reachable_objects,
+            reachable_outcomes,
+            unreachable_objects,
+            unreachable_outcomes,
+        })
     }
 
     fn put_object<T: Serialize>(&self, kind: ObjectKind, object: &T) -> anyhow::Result<Hash> {
@@ -78,9 +186,109 @@ impl Store {
         Ok(Some(encode::from_slice(&envelope.payload)?))
     }
 
+    fn get_object_envelope(&self, hash: &Hash) -> anyhow::Result<Option<StoredObject>> {
+        self.get_at::<StoredObject>(&self.object_path(hash))
+    }
+
+    fn mark_reachable_object(
+        &self,
+        hash: &Hash,
+        reachable_objects: &mut BTreeSet<Hash>,
+        reachable_outcomes: &mut BTreeSet<Hash>,
+    ) -> anyhow::Result<()> {
+        if !reachable_objects.insert(hash.clone()) {
+            return Ok(());
+        }
+
+        let Some(envelope) = self.get_object_envelope(hash)? else {
+            return Ok(());
+        };
+
+        if envelope.schema != 1 {
+            anyhow::bail!("object {hash} uses unsupported schema {}", envelope.schema);
+        }
+
+        match envelope.kind {
+            ObjectKind::Node => {
+                let node = encode::from_slice::<Node>(&envelope.payload)?;
+                self.mark_node_references(&node, reachable_objects, reachable_outcomes)?;
+                if let Some(outcome) = self.get_outcome(hash)? {
+                    reachable_outcomes.insert(hash.clone());
+                    self.mark_outcome_references(&outcome, reachable_objects, reachable_outcomes)?;
+                }
+            }
+            ObjectKind::Value => {
+                let value = encode::from_slice::<Value>(&envelope.payload)?;
+                self.mark_value_references(&value, reachable_objects, reachable_outcomes)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn mark_node_references(
+        &self,
+        node: &Node,
+        reachable_objects: &mut BTreeSet<Hash>,
+        reachable_outcomes: &mut BTreeSet<Hash>,
+    ) -> anyhow::Result<()> {
+        match node {
+            Node::Value(value) => {
+                self.mark_value_references(value, reachable_objects, reachable_outcomes)?;
+            }
+            Node::Thunk { target } => {
+                self.mark_reachable_object(target, reachable_objects, reachable_outcomes)?;
+            }
+            Node::Apply { args, .. } | Node::HostCall { args, .. } => {
+                for arg in args {
+                    self.mark_reachable_object(arg, reachable_objects, reachable_outcomes)?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn mark_value_references(
+        &self,
+        value: &Value,
+        reachable_objects: &mut BTreeSet<Hash>,
+        reachable_outcomes: &mut BTreeSet<Hash>,
+    ) -> anyhow::Result<()> {
+        match value {
+            Value::Int(_) | Value::Text(_) | Value::Bytes(_) => {}
+            Value::Tuple(items) => {
+                for item in items {
+                    self.mark_reachable_object(item, reachable_objects, reachable_outcomes)?;
+                }
+            }
+            Value::Artifact(hash) => {
+                self.mark_reachable_object(hash, reachable_objects, reachable_outcomes)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn mark_outcome_references(
+        &self,
+        outcome: &Outcome,
+        reachable_objects: &mut BTreeSet<Hash>,
+        reachable_outcomes: &mut BTreeSet<Hash>,
+    ) -> anyhow::Result<()> {
+        match outcome {
+            Outcome::Success(hash) => {
+                self.mark_reachable_object(hash, reachable_objects, reachable_outcomes)?;
+            }
+            Outcome::Failure(_) => {}
+        }
+
+        Ok(())
+    }
+
     fn put_at<T: Serialize>(&self, path: &Path, object: &T) -> anyhow::Result<()> {
         let bytes = encode(object)?;
-        self.put_bytes(path, &bytes)
+        self.put_bytes_if_absent(path, &bytes)
     }
 
     fn get_at<T: DeserializeOwned>(&self, path: &Path) -> anyhow::Result<Option<T>> {
@@ -92,19 +300,17 @@ impl Store {
         Ok(Some(encode::from_slice(&bytes)?))
     }
 
-    fn put_bytes(&self, path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    fn put_bytes_if_absent(&self, path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
         if path.exists() {
             return Ok(());
         }
 
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
+        write_bytes_atomic(path, bytes)
+    }
 
-        let tmp = path.with_extension("tmp");
-        fs::write(&tmp, bytes)?;
-        fs::rename(tmp, path)?;
-        Ok(())
+    fn replace_at<T: Serialize>(&self, path: &Path, object: &T) -> anyhow::Result<()> {
+        let bytes = encode(object)?;
+        write_bytes_atomic(path, &bytes)
     }
 
     fn object_path(&self, hash: &Hash) -> PathBuf {
@@ -120,6 +326,49 @@ impl Store {
             .join(hash.shard())
             .join(format!("{}.r2out", hash.body()))
     }
+
+    fn roots_path(&self) -> PathBuf {
+        self.root.join("roots.r2")
+    }
+
+    fn aliases_path(&self) -> PathBuf {
+        self.root.join("aliases.r2")
+    }
+
+    fn object_hashes(&self) -> anyhow::Result<BTreeSet<Hash>> {
+        collect_hashes(&self.root.join("objects"), "r2obj")
+    }
+
+    fn outcome_hashes(&self) -> anyhow::Result<BTreeSet<Hash>> {
+        collect_hashes(&self.root.join("outcomes"), "r2out")
+    }
+
+    fn load_roots(&self) -> anyhow::Result<RootsFile> {
+        Ok(self.get_at(&self.roots_path())?.unwrap_or_default())
+    }
+
+    fn save_roots(&self, roots: &RootsFile) -> anyhow::Result<()> {
+        self.replace_at(&self.roots_path(), roots)
+    }
+
+    fn load_aliases(&self) -> anyhow::Result<AliasesFile> {
+        Ok(self.get_at(&self.aliases_path())?.unwrap_or_default())
+    }
+
+    fn save_aliases(&self, aliases: &AliasesFile) -> anyhow::Result<()> {
+        self.replace_at(&self.aliases_path(), aliases)
+    }
+}
+
+fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let tmp = path.with_extension("tmp");
+    fs::write(&tmp, bytes)?;
+    fs::rename(tmp, path)?;
+    Ok(())
 }
 
 fn encode<T: Serialize>(object: &T) -> anyhow::Result<Vec<u8>> {
@@ -146,4 +395,88 @@ struct StoredObject {
     kind: ObjectKind,
     schema: u32,
     payload: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct RootsFile {
+    schema: u32,
+    pins: BTreeMap<String, Hash>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct AliasesFile {
+    schema: u32,
+    names: BTreeMap<String, Hash>,
+}
+
+#[derive(Default)]
+struct DirStats {
+    files: u64,
+    bytes: u64,
+}
+
+fn dir_stats(path: &Path) -> anyhow::Result<DirStats> {
+    if !path.exists() {
+        return Ok(DirStats::default());
+    }
+
+    let mut stats = DirStats::default();
+    accumulate_dir_stats(path, &mut stats)?;
+    Ok(stats)
+}
+
+fn accumulate_dir_stats(path: &Path, stats: &mut DirStats) -> anyhow::Result<()> {
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let metadata = entry.metadata()?;
+        if metadata.is_dir() {
+            accumulate_dir_stats(&entry.path(), stats)?;
+        } else if metadata.is_file() {
+            stats.files += 1;
+            stats.bytes += metadata.len();
+        }
+    }
+
+    Ok(())
+}
+
+fn file_len(path: &Path) -> anyhow::Result<u64> {
+    if !path.exists() {
+        return Ok(0);
+    }
+
+    Ok(fs::metadata(path)?.len())
+}
+
+fn collect_hashes(path: &Path, extension: &str) -> anyhow::Result<BTreeSet<Hash>> {
+    let mut hashes = BTreeSet::new();
+    if !path.exists() {
+        return Ok(hashes);
+    }
+
+    collect_hashes_inner(path, extension, &mut hashes)?;
+    Ok(hashes)
+}
+
+fn collect_hashes_inner(
+    path: &Path,
+    extension: &str,
+    hashes: &mut BTreeSet<Hash>,
+) -> anyhow::Result<()> {
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let metadata = entry.metadata()?;
+        let path = entry.path();
+
+        if metadata.is_dir() {
+            collect_hashes_inner(&path, extension, hashes)?;
+        } else if metadata.is_file()
+            && path.extension().and_then(|value| value.to_str()) == Some(extension)
+            && let Some(stem) = path.file_stem().and_then(|value| value.to_str())
+        {
+            hashes.insert(Hash::from_str(&format!("sha256:{stem}"))?);
+        }
+    }
+
+    Ok(())
 }
